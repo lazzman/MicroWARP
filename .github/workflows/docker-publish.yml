@@ -2,10 +2,13 @@ name: Build and Publish MicroWARP
 
 # ==========================================
 # 触发条件：
-# 1. 发布 Release 时自动构建，并补齐 Release notes（Describe this release）
-# 2. 手动点击触发 (workflow_dispatch)
+# 1. 推送到 main 分支时自动构建并发布最新 Docker 镜像
+# 2. 发布 Release 时自动构建，并补齐 Release notes（Describe this release）
+# 3. 手动点击触发 (workflow_dispatch)
 # ==========================================
 on:
+  push:
+    branches: [main]
   release:
     types: [published]
   workflow_dispatch:

@@ -1,0 +1,4 @@
+interface:
+  display_name: "同步 MicroWARP 作者仓库"
+  short_description: "安全变基到 upstream/main，并保留本地提交与工作区。"
+  default_prompt: "使用项目专用 rebase 脚本将当前分支安全同步到作者仓库 upstream/main，解决冲突并完成验证。"

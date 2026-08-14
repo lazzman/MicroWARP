@@ -24,6 +24,16 @@ jobs:
       - name: 📥 检出项目源码
         uses: actions/checkout@v4
 
+      - name: 🧪 内置代理、网络命名空间与 TCP 上游单元测试
+        run: |
+          python3 tests/test_lb_proxy.py
+          bash tests/test_netns_utils.sh
+          bash tests/test_health_events.sh
+          bash tests/test_instance_runtime_metadata.sh
+          bash tests/test_resolve_preference.sh
+          bash tests/test_upstream_tcp_mode.sh
+          python3 tests/test_tcp_socks5_relay.py
+
       - name: 🔨 从源码构建 Docker 镜像 (Local Build)
         run: |
           set -eux
@@ -31,6 +41,23 @@ jobs:
           docker build -t microwarp-test:local .
           docker run --rm microwarp-test:local sh -c \
             'command -v microsocks && command -v usque && (usque version || usque --help | head -n 5)'
+          # 验证 ip netns exec 会为子实例挂载 /etc/netns/<名称>/resolv.conf。
+          docker run --rm \
+            --cap-add NET_ADMIN \
+            --cap-add SYS_ADMIN \
+            --security-opt seccomp=unconfined \
+            --entrypoint /bin/bash microwarp-test:local -ec '
+              ip netns add microwarp-dns-test
+              export NETNS_DNS_SERVERS=1.1.1.1,1.0.0.1
+              source /app/netns-utils.sh
+              netns_write_resolv_conf microwarp-dns-test
+              expected="$(cat /etc/netns/microwarp-dns-test/resolv.conf)"
+              actual="$(ip netns exec microwarp-dns-test cat /etc/resolv.conf)"
+              test "$actual" = "$expected"
+              echo "网络命名空间 DNS 挂载验证通过"
+            '
+          # MicroSOCKS 成功响应必须把实际出站 socket 的 IPv4 / IPv6 地址族传给 LB。
+          bash tests/test_microsocks_egress_family.sh microwarp-test:local
 
       - name: 🧰 写入测试辅助脚本
         run: |

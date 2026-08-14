@@ -1,51 +1,158 @@
 services:
   microwarp:
-    image: ghcr.io/ccbkkb/microwarp:latest
-    # build: .   # uncomment to build from local sources
+    image: ${MICROWARP_IMAGE:-ghcr.io/lazzman/microwarp:latest}
+    # 本地开发或尚未发布 GHCR 镜像时，取消下一行注释。
+    # build: .
     container_name: microwarp
     restart: always
     ports:
-      - "127.0.0.1:1080:1080"
+      # 无论单实例还是多实例，容器只公开这一个入口端口。
+      - "127.0.0.1:${BIND_PORT:-1080}:${BIND_PORT:-1080}/tcp"
+    # Linux Docker 访问宿主上游代理时使用 host.docker.internal；Docker Desktop 已内置该名称。
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     cap_add:
       - NET_ADMIN
+      # 仅允许尝试加载模块；不能补齐宿主机缺失的 WireGuard 内核模块。
       - SYS_MODULE
+      # 多实例（INSTANCE_COUNT > 1）时取消下一行注释。
+      # - SYS_ADMIN
     sysctls:
-      # Required for WireGuard mark-based routing
       - net.ipv4.conf.all.src_valid_mark=1
-      # Dual-stack: allow IPv6 inside the container network namespace
       - net.ipv6.conf.all.disable_ipv6=0
       - net.ipv6.conf.default.disable_ipv6=0
       - net.ipv6.conf.all.forwarding=1
-    # environment:
-    #   # --- protocol ---
-    #   - TUNNEL_PROTOCOL=wireguard   # wireguard (default, kernel) | masque (usque)
-    #   - MASQUE_PROXY_MODE=l4-socks  # l4-socks (TCP-only, lighter) | socks (gVisor L3)
-    #   - MASQUE_HTTP2=0              # 1 = TCP/HTTP2 fallback (needs MASQUE_PROXY_MODE=socks)
-    #   - MASQUE_SNI=                 # optional SNI override (full socks only)
-    #   - GOMEMLIMIT=512MiB           # soft cap Go RSS on MASQUE path
-    #   - WARP_JWT=                   # Zero Trust team token (MASQUE register)
-    #   - WARP_LICENSE=               # optional WARP+ key
-    #   - USQUE_DEVICE_NAME=MicroWARP
-    #   # --- common ---
-    #   - BIND_ADDR=0.0.0.0           # SOCKS5 listen address (use :: for dual-stack listen)
-    #   - BIND_PORT=1080              # SOCKS5 listen port
-    #   - SOCKS_USER=admin            # optional auth username
-    #   - SOCKS_PASS=123456           # optional auth password
-    #   - ENABLE_IPV6=1               # 1/true = dual-stack WARP (default); 0 = IPv4 only
-    #   - MTU=1280                    # WireGuard MTU
-    #   - KEEPALIVE=15                # PersistentKeepalive seconds
-    #   - ENDPOINT_IP=162.159.192.1:4500 # custom WARP endpoint (WireGuard only)
-    #   - GH_PROXY=https://github.ednovas.xyz  # GitHub proxy prefix for wgcf download
-    #   - TAILSCALE_CIDR=100.64.0.0/10   # IPv4 mesh return path CIDR
-    #   - TAILSCALE_CIDR_V6=fd7a:115c:a1e0::/48  # IPv6 mesh return path CIDR
-    #   - MICROWARP_TEST_MODE=0       # 1 = skip init (CI)
+      # 多实例时必须启用。
+      # - net.ipv4.ip_forward=1
+    # 上游 SOCKS5 的 transport=tun 需要 /dev/net/tun；transport=tcp（仅 MASQUE HTTP/2）不需要。
+    # /dev/net/tun 不同于宿主机 wireguard 模块。
+    # 默认 WireGuard 路径请先在宿主机执行：ip link add microwarp-wg-check type wireguard。
+    # devices:
+    #   - /dev/net/tun:/dev/net/tun
+    # 部分 Docker 宿主机创建网络命名空间需要取消下一行注释。
+    # security_opt:
+    #   - seccomp:unconfined
+    environment:
+      # --- 基础隧道 ---
+      TUNNEL_PROTOCOL: ${TUNNEL_PROTOCOL:-wireguard}
+      BIND_ADDR: ${BIND_ADDR:-0.0.0.0}
+      BIND_PORT: ${BIND_PORT:-1080}
+      SOCKS_USER: ${SOCKS_USER:-}
+      SOCKS_PASS: ${SOCKS_PASS:-}
+      # 仅启用 WARP IPv6 路由；目标域名地址族偏好请设置 RESOLVE_PREFERENCE。
+      ENABLE_IPV6: ${ENABLE_IPV6:-1}
+      MTU: ${MTU:-1280}
+      KEEPALIVE: ${KEEPALIVE:-15}
+      ENDPOINT_IP: ${ENDPOINT_IP:-}
+      GH_PROXY: ${GH_PROXY:-}
+      TAILSCALE_CIDR: ${TAILSCALE_CIDR:-100.64.0.0/10}
+      TAILSCALE_CIDR_V6: ${TAILSCALE_CIDR_V6:-fd7a:115c:a1e0::/48}
+      # WireGuard 域名解析：auto | ipv4_prefer | ipv6_prefer | ipv4_only | ipv6_only。
+      # prefer 会回退另一地址族；only 仅解析一种地址族。
+      RESOLVE_PREFERENCE: ${RESOLVE_PREFERENCE:-auto}
+      # 高级：直接单实例的 WireGuard 配置文件与接口名。
+      WG_CONF: ${WG_CONF:-/etc/wireguard/wg0.conf}
+      WG_IFACE: ${WG_IFACE:-wg0}
+
+      # --- MASQUE ---
+      # l4-socks = HTTP/3 QUIC（轻量、仅 TCP）；QUIC 不通时改 socks + MASQUE_HTTP2=1。
+      MASQUE_PROXY_MODE: ${MASQUE_PROXY_MODE:-l4-socks}
+      MASQUE_HTTP2: ${MASQUE_HTTP2:-0}
+      MASQUE_SNI: ${MASQUE_SNI:-}
+      MASQUE_MTU: ${MASQUE_MTU:-}
+      MASQUE_DNS_SERVERS: ${MASQUE_DNS_SERVERS:-}
+      GOMEMLIMIT: ${GOMEMLIMIT:-512MiB}
+      WARP_JWT: ${WARP_JWT:-}
+      WARP_LICENSE: ${WARP_LICENSE:-}
+      USQUE_DEVICE_NAME: ${USQUE_DEVICE_NAME:-MicroWARP}
+      USQUE_CONFIG: ${USQUE_CONFIG:-/etc/wireguard/masque-config.json}
+
+      # --- 单容器控制面 ---
+      INSTANCE_COUNT: ${INSTANCE_COUNT:-1}
+      # 多实例初始化的启动错峰秒数；设为 0 可最快拉起，调大可平滑首次注册压力。
+      INSTANCE_START_STAGGER: ${INSTANCE_START_STAGGER:-0.2}
+      PROXY_MODE: ${PROXY_MODE:-socks5} # socks5 | mixed（SOCKS5 + HTTP）
+      CONTROL_PLANE_ENABLED: ${CONTROL_PLANE_ENABLED:-auto}
+      LB_ENABLED: ${LB_ENABLED:-auto}
+      LB_STRATEGY: ${LB_STRATEGY:-round}
+      LB_STICKY_MODE: ${LB_STICKY_MODE:-username-round}
+      LB_ROTATE_INTERVAL: ${LB_ROTATE_INTERVAL:-5m}
+      LB_MAX_CONN: ${LB_MAX_CONN:-512}
+      # 设为 1 时记录请求 ID、客户端、用户 ID、目标、实际 IPv4/IPv6 出口、后端及可解析 HTTP 请求头；默认避免日志刷屏。
+      # Authorization、Proxy-Authorization、Cookie、Token 等敏感字段值始终脱敏。
+      LB_ACCESS_LOG: ${LB_ACCESS_LOG:-0}
+      # 设为 0 时不记录 HTTP 请求头；HTTP CONNECT 只能看到 CONNECT 握手头，无法解密 TLS 内部请求头。
+      LB_ACCESS_LOG_HEADERS: ${LB_ACCESS_LOG_HEADERS:-1}
+      # 单条 HTTP 请求头日志最大字符数，范围 256~65536；超出会标记截断。
+      LB_ACCESS_LOG_HEADER_MAX_CHARS: ${LB_ACCESS_LOG_HEADER_MAX_CHARS:-8192}
+      # 复用 BIND_PORT 的匿名管理面板；启用后单实例 socks5 也会启动 LB 与控制面。
+      # 访问 http://<宿主机>:${BIND_PORT}/__microwarp/；请仅向可信网络映射此端口。
+      MANAGEMENT_UI_ENABLED: ${MANAGEMENT_UI_ENABLED:-0}
+      # 启用、优雅重连或强制重连后等待 WARP 探测成功的最大秒数。
+      # 强制重连跳过连接排空并会中断该实例上的现有代理连接。
+      # 超时时会记录失败阶段、原因码和固定执行耗时，供管理页诊断。
+      MANAGEMENT_ACTION_PROBE_TIMEOUT: ${MANAGEMENT_ACTION_PROBE_TIMEOUT:-180}
+      # 双向无流量超时，而非连接总时长；默认 600 秒适合 LLM 流式输出。
+      # 设为 0 或负数不会关闭超时，反而会造成连接快速断开。
+      LB_IDLE_TIMEOUT: ${LB_IDLE_TIMEOUT:-600}
+      LB_HANDSHAKE_TIMEOUT: ${LB_HANDSHAKE_TIMEOUT:-30}
+      # 多实例注册与隧道进程使用的命名空间 DNS，避免 Docker 127.0.0.11 不在子命名空间监听。
+      NETNS_DNS_SERVERS: ${NETNS_DNS_SERVERS:-1.1.1.1,1.0.0.1}
+      # 高级：仅单实例 Mixed/LB 的内部后端端口，始终不对外发布。
+      INTERNAL_PROXY_PORT: ${INTERNAL_PROXY_PORT:-1081}
+      # 高级：控制面的临时 PID、健康状态与后端文件目录。
+      MICROWARP_RUNTIME_ROOT: ${MICROWARP_RUNTIME_ROOT:-/run/microwarp}
+      # 仅用于 CI / dry-run；设为 1 会跳过全部初始化。
+      MICROWARP_TEST_MODE: ${MICROWARP_TEST_MODE:-0}
+
+      # --- 健康、自愈与滚动重启 ---
+      HEALTH_CHECK_INTERVAL: ${HEALTH_CHECK_INTERVAL:-60}
+      HEALTH_PROBE_TIMEOUT: ${HEALTH_PROBE_TIMEOUT:-10}
+      # 健康守护、Docker 健康检查与管理面共享的实际 HTTP 探测全局并发上限。
+      HEALTH_PROBE_CONCURRENCY: ${HEALTH_PROBE_CONCURRENCY:-32}
+      # 大批实例同时就绪时合并后端池更新，避免逐实例持锁重建。
+      BACKEND_POOL_LOCK_TIMEOUT: ${BACKEND_POOL_LOCK_TIMEOUT:-90}
+      BACKEND_POOL_BATCH_WINDOW_MS: ${BACKEND_POOL_BATCH_WINDOW_MS:-100}
+      HEALTH_SOFT_FAILURES: ${HEALTH_SOFT_FAILURES:-3}
+      HEALTH_START_PERIOD: ${HEALTH_START_PERIOD:-90}
+      HEALTH_STARTUP_RETRY_INTERVAL: ${HEALTH_STARTUP_RETRY_INTERVAL:-3}
+      # 首次观测与实例状态变化时输出全量图标状态表（含每实例 LB 活跃连接数）；设为 0 可关闭。
+      # 单实例轻量直连不经过 LB，连接数会显示为“—”。
+      STATUS_EVENT_LOG: ${STATUS_EVENT_LOG:-1}
+      ROTATE_RESTART_ENABLED: ${ROTATE_RESTART_ENABLED:-auto}
+      ROTATE_RESTART_INTERVAL: ${ROTATE_RESTART_INTERVAL:-6h}
+      ROTATE_RESTART_PROBE_TIMEOUT: ${ROTATE_RESTART_PROBE_TIMEOUT:-90}
+      ROTATE_RESTART_RETRIES: ${ROTATE_RESTART_RETRIES:-2}
+      # auto 按当前实例总数的 1/5 并行滚动；繁忙实例会继续服务并延后至下次检查。
+      # 正整数可显式指定并发数量。
+      ROTATE_RESTART_CONCURRENCY: ${ROTATE_RESTART_CONCURRENCY:-auto}
+      # 延后队列的连接复查间隔，支持秒数或 1m 等时长。
+      ROTATE_RESTART_DEFERRED_CHECK_INTERVAL: ${ROTATE_RESTART_DEFERRED_CHECK_INTERVAL:-60}
+      # 最近滚动重启摘要及失败诊断的保留轮数。
+      ROTATE_RESTART_HISTORY_LIMIT: ${ROTATE_RESTART_HISTORY_LIMIT:-20}
+
+      # --- 上游 SOCKS5：WARP 注册和外层连接经此代理建立 ---
+      # 已验证 LAN 示例：socks5://192.168.1.15:20122。
+      # 不要使用容器自身的 127.0.0.1；宿主 loopback 请改用 host.docker.internal。
+      UPSTREAM_SOCKS5: ${UPSTREAM_SOCKS5:-}
+      # tun=完整 TUN 路径（默认，需要 UDP）；tcp=标准 SOCKS5 CONNECT，
+      # 仅 TUNNEL_PROTOCOL=masque + MASQUE_PROXY_MODE=socks + MASQUE_HTTP2=1 可用。
+      UPSTREAM_SOCKS5_TRANSPORT: ${UPSTREAM_SOCKS5_TRANSPORT:-tun}
+      # udp=标准 SOCKS5 UDP Associate；tcp=UDP-in-TCP 扩展。
+      UPSTREAM_SOCKS5_UDP_MODE: ${UPSTREAM_SOCKS5_UDP_MODE:-udp}
+      UPSTREAM_MTU: ${UPSTREAM_MTU:-1280}
+      # tun：验证数值 TCP 与 UDP；tcp：只验证标准 SOCKS5 CONNECT 的数值 HTTPS。
+      # 失败时不会尝试直连 WARP（UPSTREAM_REQUIRED=1）。
+      UPSTREAM_VERIFY: ${UPSTREAM_VERIFY:-1}
+      UPSTREAM_PROBE_TIMEOUT: ${UPSTREAM_PROBE_TIMEOUT:-8}
+      UPSTREAM_REQUIRED: ${UPSTREAM_REQUIRED:-1}
     logging:
       driver: json-file
       options:
         max-size: "3m"
         max-file: "3"
     volumes:
-      # Persists wg0.conf (WireGuard) and masque-config.json (MASQUE)
+      # 单实例身份与多实例 identities 都在此目录持久化。
       - warp-data:/etc/wireguard
 
 volumes:

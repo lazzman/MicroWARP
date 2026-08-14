@@ -1,0 +1,2 @@
+# Unified diff 文件必须保留原始源代码的上下文缩进，避免将其误判为源码空白错误。
+patches/*.patch whitespace=-blank-at-eol,-space-before-tab

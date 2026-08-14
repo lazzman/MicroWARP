@@ -1,0 +1,223 @@
+diff --git a/server.c b/server.c
+index 9f0ab9a..2af5365 100644
+--- a/server.c
++++ b/server.c
+@@ -1,8 +1,53 @@
+ #include "server.h"
+ #include <stdio.h>
++#include <stdlib.h>
++#include <strings.h>
+ #include <string.h>
+ #include <unistd.h>
+ 
++enum target_family_mode {
++	TARGET_FAMILY_AUTO,
++	TARGET_FAMILY_IPV4_ONLY,
++	TARGET_FAMILY_IPV6_ONLY,
++	TARGET_FAMILY_IPV4_PREFER,
++	TARGET_FAMILY_IPV6_PREFER,
++};
++
++/*
++ * 仅供 SOCKS 目标域名解析使用。监听地址和 -b 绑定地址保持 AF_UNSPEC，
++ * 避免 RESOLVE_PREFERENCE 影响服务监听与本地接口解析。
++ */
++static enum target_family_mode target_family_mode(void) {
++	const char *value = getenv("RESOLVE_PREFERENCE");
++	if(!value || !*value || !strcasecmp(value, "auto")) return TARGET_FAMILY_AUTO;
++	if(!strcasecmp(value, "ipv4_only") || !strcasecmp(value, "ipv4") || !strcasecmp(value, "v4"))
++		return TARGET_FAMILY_IPV4_ONLY;
++	if(!strcasecmp(value, "ipv6_only") || !strcasecmp(value, "ipv6") || !strcasecmp(value, "v6"))
++		return TARGET_FAMILY_IPV6_ONLY;
++	if(!strcasecmp(value, "ipv4_prefer") || !strcasecmp(value, "ipv4-prefer"))
++		return TARGET_FAMILY_IPV4_PREFER;
++	if(!strcasecmp(value, "ipv6_prefer") || !strcasecmp(value, "ipv6-prefer"))
++		return TARGET_FAMILY_IPV6_PREFER;
++	return TARGET_FAMILY_AUTO;
++}
++
++static int target_family_filter(void) {
++	switch(target_family_mode()) {
++		case TARGET_FAMILY_IPV4_ONLY: return AF_INET;
++		case TARGET_FAMILY_IPV6_ONLY: return AF_INET6;
++		default: return AF_UNSPEC;
++	}
++}
++
++/* 优先模式仍解析双栈；SOCKS 服务用此值在候选结果中先选目标地址族。 */
++int target_family_preferred(void) {
++	switch(target_family_mode()) {
++		case TARGET_FAMILY_IPV4_PREFER: return AF_INET;
++		case TARGET_FAMILY_IPV6_PREFER: return AF_INET6;
++		default: return AF_UNSPEC;
++	}
++}
++
+ int resolve(const char *host, unsigned short port, struct addrinfo** addr) {
+ 	struct addrinfo hints = {
+ 		.ai_family = AF_UNSPEC,
+@@ -14,6 +59,16 @@ int resolve(const char *host, unsigned short port, struct addrinfo** addr) {
+ 	return getaddrinfo(host, port_buf, &hints, addr);
+ }
+ 
++int resolve_target(const char *host, unsigned short port, struct addrinfo** addr) {
++	struct addrinfo hints = {
++		.ai_family = target_family_filter(),
++		.ai_socktype = SOCK_STREAM,
++	};
++	char port_buf[8];
++	snprintf(port_buf, sizeof port_buf, "%u", port);
++	return getaddrinfo(host, port_buf, &hints, addr);
++}
++
+ int resolve_sa(const char *host, unsigned short port, union sockaddr_union *res) {
+ 	struct addrinfo *ainfo = 0;
+ 	int ret;
+diff --git a/server.h b/server.h
+index 5acf664..b16a57a 100644
+--- a/server.h
++++ b/server.h
+@@ -39,6 +39,8 @@ struct server {
+ };
+ 
+ int resolve(const char *host, unsigned short port, struct addrinfo** addr);
++int resolve_target(const char *host, unsigned short port, struct addrinfo** addr);
++int target_family_preferred(void);
+ int resolve_sa(const char *host, unsigned short port, union sockaddr_union *res);
+ int bindtoip(int fd, union sockaddr_union *bindaddr);
+ 
+diff --git a/sockssrv.c b/sockssrv.c
+index c1c4fe3..415310c 100644
+--- a/sockssrv.c
++++ b/sockssrv.c
+@@ -125,13 +125,41 @@ static struct addrinfo* addr_choose(struct addrinfo* list, union sockaddr_union*
+ 	return list;
+ }
+ 
++static struct addrinfo* addr_choose_target(struct addrinfo* list, union sockaddr_union* bindaddr) {
++	int af = SOCKADDR_UNION_AF(bindaddr);
++	if(af != AF_UNSPEC) return addr_choose(list, bindaddr);
++	af = target_family_preferred();
++	if(af != AF_UNSPEC) {
++		struct addrinfo* p;
++		for(p = list; p; p = p->ai_next)
++			if(p->ai_family == af) return p;
++	}
++	return list;
++}
++
++static int connect_addrinfo(struct addrinfo* raddr, union sockaddr_union* bindaddr) {
++	int fd = socket(raddr->ai_family, SOCK_STREAM, 0);
++	if(fd == -1) return -1;
++	if(SOCKADDR_UNION_AF(bindaddr) == raddr->ai_family &&
++	   bindtoip(fd, bindaddr) == -1) goto failed;
++	if(connect(fd, raddr->ai_addr, raddr->ai_addrlen) == -1) goto failed;
++	return fd;
++failed:
++	{
++		int error = errno;
++		close(fd);
++		errno = error;
++	}
++	return -1;
++}
++
+ static int connect_socks_target(unsigned char *buf, size_t n, struct client *client) {
+ 	if(n < 5) return -EC_GENERAL_FAILURE;
+ 	if(buf[0] != 5) return -EC_GENERAL_FAILURE;
+ 	if(buf[1] != 1) return -EC_COMMAND_NOT_SUPPORTED; /* we support only CONNECT method */
+ 	if(buf[2] != 0) return -EC_GENERAL_FAILURE; /* malformed packet */
+ 
+-	int af = AF_INET;
++	int af = AF_INET, is_domain = 0;
+ 	size_t minlen = 4 + 4 + 2, l;
+ 	char namebuf[256];
+ 	struct addrinfo* remote;
+@@ -147,6 +175,7 @@ static int connect_socks_target(unsigned char *buf, size_t n, struct client *cli
+ 				return -EC_GENERAL_FAILURE; /* malformed or too long addr */
+ 			break;
+ 		case 3: /* dns name */
++			is_domain = 1;
+ 			l = buf[4];
+ 			minlen = 4 + 2 + l + 1;
+ 			if(n < 4 + 2 + l + 1) return -EC_GENERAL_FAILURE;
+@@ -158,13 +187,21 @@ static int connect_socks_target(unsigned char *buf, size_t n, struct client *cli
+ 	}
+ 	unsigned short port;
+ 	port = (buf[minlen-2] << 8) | buf[minlen-1];
+-	/* there's no suitable errorcode in rfc1928 for dns lookup failure */
+-	if(resolve(namebuf, port, &remote)) return -EC_GENERAL_FAILURE;
+-	struct addrinfo* raddr = addr_choose(remote, &bind_addr);
+-	int fd = socket(raddr->ai_family, SOCK_STREAM, 0);
++	/* 数值地址保持客户端指定的地址族；仅域名请求应用解析偏好。 */
++	if((is_domain ? resolve_target(namebuf, port, &remote) : resolve(namebuf, port, &remote)))
++		return -EC_GENERAL_FAILURE;
++	struct addrinfo* raddr = is_domain ? addr_choose_target(remote, &bind_addr) : addr_choose(remote, &bind_addr);
++	int fd = connect_addrinfo(raddr, &bind_addr);
++	/* 优先地址族不可达时，域名请求继续尝试其余候选地址族。 */
++	if(fd == -1 && is_domain && SOCKADDR_UNION_AF(&bind_addr) == AF_UNSPEC) {
++		struct addrinfo* p;
++		for(p = remote; p; p = p->ai_next) {
++			if(p == raddr) continue;
++			fd = connect_addrinfo(p, &bind_addr);
++			if(fd != -1) break;
++		}
++	}
+ 	if(fd == -1) {
+-		eval_errno:
+-		if(fd != -1) close(fd);
+ 		freeaddrinfo(remote);
+ 		switch(errno) {
+ 			case ETIMEDOUT:
+@@ -186,12 +223,6 @@ static int connect_socks_target(unsigned char *buf, size_t n, struct client *cli
+ 			return -EC_GENERAL_FAILURE;
+ 		}
+ 	}
+-	if(SOCKADDR_UNION_AF(&bind_addr) == raddr->ai_family &&
+-	   bindtoip(fd, &bind_addr) == -1)
+-		goto eval_errno;
+-	if(connect(fd, raddr->ai_addr, raddr->ai_addrlen) == -1)
+-		goto eval_errno;
+-
+ 	freeaddrinfo(remote);
+ 	if(CONFIG_LOG) {
+ 		char clientname[256];
+@@ -266,6 +297,29 @@ static void send_error(int fd, enum errorcode ec) {
+ 	write(fd, buf, 10);
+ }
+ 
++/* 成功响应中的 BND.ADDR 必须是已建立远端连接的本地绑定地址。它的地址族
++ * 与实际出站 socket 一致，供内部 LB 准确记录 IPv4 / IPv6 出口；这也符合
++ * RFC 1928 对 CONNECT 成功响应的定义。 */
++static void send_success(int client_fd, int remote_fd) {
++	union sockaddr_union bound = {.v4.sin_family = AF_UNSPEC};
++	socklen_t boundlen = sizeof bound;
++	unsigned char buf[22] = { 5, EC_SUCCESS, 0, 1 /*AT_IPV4*/ };
++	size_t len = 10;
++
++	if(getsockname(remote_fd, (struct sockaddr*) &bound, &boundlen) == 0) {
++		if(SOCKADDR_UNION_AF(&bound) == AF_INET) {
++			memcpy(buf + 4, &bound.v4.sin_addr, 4);
++			memcpy(buf + 8, &bound.v4.sin_port, 2);
++		} else if(SOCKADDR_UNION_AF(&bound) == AF_INET6) {
++			buf[3] = 4 /*AT_IPV6*/;
++			memcpy(buf + 4, &bound.v6.sin6_addr, 16);
++			memcpy(buf + 20, &bound.v6.sin6_port, 2);
++			len = 22;
++		}
++	}
++	write(client_fd, buf, len);
++}
++
+ static void copyloop(int fd1, int fd2) {
+ 	struct pollfd fds[2] = {
+ 		[0] = {.fd = fd1, .events = POLLIN},
+@@ -350,7 +404,7 @@ static int handshake(struct thread *t) {
+ 					send_error(t->client.fd, ret*-1);
+ 					return -1;
+ 				}
+-				send_error(t->client.fd, EC_SUCCESS);
++				send_success(t->client.fd, ret);
+ 				return ret;
+ 		}
+ 	}
