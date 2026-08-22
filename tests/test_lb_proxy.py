@@ -638,6 +638,10 @@ class MixedLoadBalancerTests(unittest.TestCase):
         self.assertIn(b'id="restart-schedule-actions"', body)
         self.assertIn(b"restart-schedule-action failure", body)
         self.assertIn(b"restart-schedule-toggle", body)
+        self.assertIn(b'id="restart-schedule-run-now"', body)
+        self.assertIn("立即执行".encode("utf-8"), body)
+        self.assertIn(b"function submitRestartScheduleRunNow()", body)
+        self.assertIn(b"action:'run-now'", body)
         # 高风险操作使用内嵌确认对话框，不依赖可能在字符串转义时损坏的浏览器提示文本。
         self.assertIn(b'id="confirm-dialog"', body)
         self.assertIn(b"force=name==='force-reconnect'", body)
@@ -727,6 +731,50 @@ class MixedLoadBalancerTests(unittest.TestCase):
         self.assertEqual(paused_schedule["status"], "paused")
         self.assertTrue((self.runtime / "rotate-restart.paused").exists())
 
+        # 立即执行通过一次性请求标记交给守护进程；即使自动计划已暂停，显式请求
+        # 仍应受理，且重复请求不能产生并发的第二轮滚动重启。
+        run_now_body = json.dumps({"action": "run-now"}).encode("utf-8")
+        status, _, body = self._http_request(
+            b"POST /__microwarp/api/v1/restart-schedule HTTP/1.1\r\n"
+            b"Host: localhost\r\nContent-Type: application/json\r\nContent-Length: "
+            + str(len(run_now_body)).encode("ascii")
+            + b"\r\n\r\n"
+            + run_now_body
+        )
+        self.assertEqual(status, 202)
+        run_now_payload = json.loads(body)
+        self.assertTrue(run_now_payload["accepted"])
+        self.assertTrue(run_now_payload["schedule"]["run_now_requested"])
+        self.assertTrue(run_now_payload["schedule"]["paused"])
+        self.assertEqual(run_now_payload["schedule"]["status"], "starting")
+        run_now_file = self.runtime / "rotate-restart.run-now"
+        self.assertTrue(run_now_file.exists())
+
+        status, _, body = self._http_request(
+            b"POST /__microwarp/api/v1/restart-schedule HTTP/1.1\r\n"
+            b"Host: localhost\r\nContent-Type: application/json\r\nContent-Length: "
+            + str(len(run_now_body)).encode("ascii")
+            + b"\r\n\r\n"
+            + run_now_body
+        )
+        self.assertEqual(status, 409)
+        self.assertFalse(json.loads(body)["accepted"])
+        # 本用例未启动滚动重启守护进程，手动清理请求标记以继续验证恢复计划。
+        run_now_file.unlink()
+
+        schedule_lock = self.runtime / "rotate-restart.lock"
+        schedule_lock.mkdir()
+        status, _, body = self._http_request(
+            b"POST /__microwarp/api/v1/restart-schedule HTTP/1.1\r\n"
+            b"Host: localhost\r\nContent-Type: application/json\r\nContent-Length: "
+            + str(len(run_now_body)).encode("ascii")
+            + b"\r\n\r\n"
+            + run_now_body
+        )
+        self.assertEqual(status, 409)
+        self.assertFalse(json.loads(body)["accepted"])
+        schedule_lock.rmdir()
+
         resume_body = json.dumps({"action": "resume"}).encode("utf-8")
         status, _, body = self._http_request(
             b"POST /__microwarp/api/v1/restart-schedule HTTP/1.1\r\n"
@@ -814,6 +862,35 @@ class MixedLoadBalancerTests(unittest.TestCase):
         )
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(body)["instances"][0]["active_connections"], 2)
+
+        # 摘流控制面暂未确认要独立展示，不能混入“仍有连接”的延后队列。
+        backend_retry_at = int(time.time()) + 30
+        (self.runtime / "rotate-restart.schedule.state").write_text(
+            (self.runtime / "rotate-restart.schedule.state").read_text(encoding="utf-8")
+            + f"next_backend_retry_at={backend_retry_at}\ncurrent_backend_retry=1\n",
+            encoding="utf-8",
+        )
+        (instance_runtime / "scheduled-restart.state").write_text(
+            "action=scheduled-rolling-restart\nstatus=backend-retry\nqueue=backend-retry\n"
+            "active_connections=0\nbackend_retry_attempt=1\nbackend_retry_limit=6\n"
+            f"next_check_at={backend_retry_at}\nreason_code=backend-pool-confirm-timeout\n"
+            "message=后端池摘流暂未确认，保留服务并等待控制面重试\n",
+            encoding="utf-8",
+        )
+        status, _, body = self._http_request(
+            b"GET /__microwarp/api/v1/status HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        )
+        self.assertEqual(status, 200)
+        retry_schedule = json.loads(body)["restart_schedule"]
+        self.assertEqual(retry_schedule["current"]["backend_retry"], 1)
+        self.assertEqual(retry_schedule["current"]["backend_retry_queue"]["next_check_at"], backend_retry_at)
+        status, _, body = self._http_request(
+            b"GET /__microwarp/api/v1/restart-schedule/runs/current/queue/backend-retry HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        )
+        self.assertEqual(status, 200)
+        retry_record = json.loads(body)["instances"][0]
+        self.assertEqual(retry_record["backend_retry_attempt"], 1)
+        self.assertEqual(retry_record["reason_code"], "backend-pool-confirm-timeout")
         status, _, body = self._http_request(
             f"GET /__microwarp/api/v1/restart-schedule/runs/{run_id}/failures HTTP/1.1\r\nHost: localhost\r\n\r\n".encode()
         )

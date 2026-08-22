@@ -214,6 +214,9 @@ docker compose up -d
 | `HEALTH_PROBE_CONCURRENCY` | `32` | Global maximum number of actual HTTP probe requests across health-daemon, Docker, manual, and management probes. Each instance workflow starts the WARP, IPv4 egress, and (when enabled) IPv6 egress probes in parallel; a successful WARP result immediately admits the backend while egress observations continue. |
 | `BACKEND_POOL_LOCK_TIMEOUT` | `90` | Maximum seconds to wait for another backend-pool batch commit; `0` waits indefinitely. Updates are first persisted, so a waiting process never drops a ready/drained state. |
 | `BACKEND_POOL_BATCH_WINDOW_MS` | `100` | Short coalescing window in milliseconds before committing pending backend-pool changes. Increase slightly for very large cold starts to reduce full pool rebuilds; lower it for fastest individual state visibility. |
+| `BACKEND_POOL_STALE_LOCK_TIMEOUT` | `30` | Seconds before reclaiming a backend-pool lock whose owner is missing or no longer alive. A lock with a live owner is never reclaimed. |
+| `BACKEND_POOL_OPERATION_RETRY_LIMIT` | `6` | Extra bounded retries for destructive pool operations, such as drain/restore, when their durable request has not yet been synchronously confirmed. |
+| `BACKEND_POOL_OPERATION_RETRY_MAX_DELAY` | `10` | Maximum seconds for one backend-pool operation retry backoff; backoff uses `1s`, `2s`, `5s`, then this cap. |
 | `HEALTH_SOFT_FAILURES` | `3` | Consecutive failed checks after the start period before the health daemon restarts an instance. |
 | `HEALTH_START_PERIOD` | `90` | Startup grace period in seconds; failures are not restarted during this period. Ready instances still enter the pool immediately. |
 | `HEALTH_STARTUP_RETRY_INTERVAL` | `3` | Seconds between startup probes until an instance becomes healthy. |
@@ -508,6 +511,9 @@ docker compose up -d
 | `HEALTH_PROBE_CONCURRENCY` | `32` | 健康守护、Docker 健康检查、手工探测和管理面探测共享的实际 HTTP 探测全局并发上限。每个实例工作流会并行启动 WARP 主探测、IPv4 出口探测，以及启用 IPv6 时的 IPv6 出口探测；WARP 主探测成功即入池，出口观测继续补齐状态。 |
 | `BACKEND_POOL_LOCK_TIMEOUT` | `90` | 等待其他后端池批量提交者的最长秒数；设为 `0` 表示持续等待。状态会先持久化，因此等待中的进程不会丢失实例就绪或摘流更新。 |
 | `BACKEND_POOL_BATCH_WINDOW_MS` | `100` | 提交待处理后端池更新前的短暂聚合窗口（毫秒）。大规模冷启动时可适当调大以减少全量重建；追求单实例状态可见性时可调小。 |
+| `BACKEND_POOL_STALE_LOCK_TIMEOUT` | `30` | 后端池锁的 owner 缺失或其进程已退出时，等待多少秒后自动回收该遗留锁。存活 owner 持有的锁绝不会被回收。 |
+| `BACKEND_POOL_OPERATION_RETRY_LIMIT` | `6` | 摘流或恢复这类需要**同步确认**的后端池操作，在请求已持久化但尚未确认写入目标状态时可额外退避重试的次数。超过预算才记为最终失败。 |
+| `BACKEND_POOL_OPERATION_RETRY_MAX_DELAY` | `10` | 后端池操作重试的单次最大退避秒数；实际退避为 `1s`、`2s`、`5s`，之后封顶。 |
 | `HEALTH_SOFT_FAILURES` | `3` | 启动宽限期后，健康守护重启实例前允许的连续失败次数。 |
 | `HEALTH_START_PERIOD` | `90` | 启动宽限期秒数；此期间失败不会触发重启，已就绪的实例仍会立即加入池。 |
 | `HEALTH_STARTUP_RETRY_INTERVAL` | `3` | 实例未就绪时的启动探测间隔秒数。 |
@@ -673,13 +679,13 @@ services:
 
 当前 PC 端采用“克制画布”布局并默认使用浅色主题：顶部导航聚焦总览、实例、连接和日志；运行概览以高留白指标区展示可用实例、连接数与上下行流量，实例与连接使用完整字段表呈现，控制台日志采用全宽时间线面板展示。自动滚动重启中的实例也会进入“进行中的任务”与“操作中”筛选，并在当前操作栏实时显示空闲复核、摘流、重启实例、WARP 健康探测等阶段、剩余连接数和已耗时；完成后该临时状态会自动清除。
 
-管理面板还会在实例表前展示“**定时重启计划**”：它区分尚未触发的计划与正在执行的任务，显示启用/暂停状态、`ROTATE_RESTART_INTERVAL` 对应的周期、下次执行的绝对时间与倒计时、实例范围、有效并行额度、空闲优先策略，以及最近一轮的完成时间、耗时、成功、延后和失败数量。时间按访问者浏览器的本地时区显示；下次执行时间由容器内调度器写入状态文件，避免浏览器自行推导间隔。点击“管理计划”可查看完整策略，并可暂停或恢复**后续**轮次：暂停不会中断已经开始的滚动重启，也不会改写 `ROTATE_RESTART_*` 环境变量；容器重启后该运行时暂停标记会自动清除，恢复为环境变量配置。定时滚动重启仅在多实例部署中可用，单实例面板会明确显示“仅多实例”。滚动重启实际执行时，计划卡显示整体进度；尚未轮到的空闲节点会在实例表“当前操作”中显示“等待定时重启”和队列位置，仍有活跃连接的节点会显示“等待自然空闲”，且继续留在后端池提供服务；正在处理的节点则继续在“进行中的任务”与实例行中展示摘流、重启及健康探测阶段。
+管理面板还会在实例表前展示“**定时重启计划**”：它区分尚未触发的计划与正在执行的任务，显示启用/暂停状态、`ROTATE_RESTART_INTERVAL` 对应的周期、下次执行的绝对时间与倒计时、实例范围、有效并行额度、空闲优先策略，以及最近一轮的完成时间、耗时、成功、延后和失败数量。时间按访问者浏览器的本地时区显示；下次执行时间由容器内调度器写入状态文件，避免浏览器自行推导间隔。点击“管理计划”可查看完整策略，并可暂停或恢复**后续**轮次，也可点击“立即执行”请求守护进程立刻启动一轮滚动重启。立即执行与定时任务采用同一套空闲优先、繁忙延后、并发额度和单飞锁；请求受理后页面先显示“正在启动”，守护进程接管后显示实时进度。暂停不会中断已经开始的滚动重启；暂停状态下的“立即执行”仍会执行本轮，但不会恢复后续定时轮次，也不会改写 `ROTATE_RESTART_*` 环境变量；容器重启后该运行时暂停标记会自动清除，恢复为环境变量配置。定时滚动重启仅在多实例部署中可用，单实例面板会明确显示“仅多实例”。滚动重启实际执行时，计划卡显示整体进度；尚未轮到的空闲节点会在实例表“当前操作”中显示“等待定时重启”和队列位置，仍有活跃连接的节点会显示“等待自然空闲”，且继续留在后端池提供服务；正在处理的节点则继续在“进行中的任务”与实例行中展示摘流、重启及健康探测阶段。
 
 “当前活跃连接”只保留仍在转发的会话，显示请求 ID、协议、客户端、已提供的用户 ID、目标、**实际出口地址族（IPv4 / IPv6）**、后端实例、持续时间、空闲时间及双向字节数；双向流量统一按 **KB** 显示，连接关闭后立即从列表移除，不保留历史。每个实例可执行优雅重连、**强制重连**、停用或启用：优雅重连和停用会先进入空闲优先队列；有活跃连接时保持在后端池继续服务，**不设排空超时**，仅每 `ROTATE_RESTART_DEFERRED_CHECK_INTERVAL` 检查一次是否已自然空闲；连接归零后才摘流并执行操作。**强制重连**会立即摘流并停止实例，因此会中断该实例上的现有代理连接。启用或任一种重连后均等待 WARP 探测成功才入池。手工停用仅在当前容器运行期有效，容器重启后自动恢复启用；停用状态下两种重连都会被拒绝，需先启用。
 
 页面工具栏提供“临时添加”和“批量移除”。临时实例会使用与基础多实例相同的网络命名空间、健康探测和后端池机制，只写入 `/run/microwarp/instances.dynamic`；**容器重启后会自动恢复为 `INSTANCE_COUNT` 配置的基础实例数量**。因此仅支持 `INSTANCE_COUNT>=2` 的多实例部署，且基础实例与临时实例的总数最多为 `255`（实例 ID `0`~`254`）；临时实例同样支持启用、停用、优雅重连和强制重连，批量移除只允许选择临时实例。首次添加会异步触发健康探测，不会因可选双栈出口观测拖慢后续添加请求。顶部导航会固定在页面顶部，并提供自动刷新下拉选项：`1 秒`、`3 秒`、`5 秒`、`10 秒`、`15 秒`、`30 秒`，默认 `5 秒`。控制台日志面板默认显示 `/run/microwarp/console.log` 的最近 300 行，可用 `MANAGEMENT_LOG_LINES` 调整范围；提供“回到底部”以重新跟随实时输出，以及“复制日志”以复制当前显示内容。自动化调用：`POST /__microwarp/api/v1/instances/<实例号>/force-reconnect` 用于强制重连；`POST /__microwarp/api/v1/instances` 并传入 `{"action":"add","count":2}` 可临时添加 2 个实例，或传入 `{"action":"remove","ids":[2,3]}` 批量移除临时实例；接口立即返回 `202`，随后通过状态接口轮询结果。
 
-定时计划自动化接口为 `POST /__microwarp/api/v1/restart-schedule`：传入 `{"action":"pause"}` 暂停后续定时滚动重启，传入 `{"action":"resume"}` 恢复；接口返回当前计划快照。计划详情与执行结果同时包含在 `GET /__microwarp/api/v1/status` 的 `restart_schedule` 字段中。该接口仅接受 `pause` / `resume`，不在运行时修改周期、并发或延后队列复查配置；如需调整这些策略，请修改对应的 `ROTATE_RESTART_*` 环境变量后重建容器。
+定时计划自动化接口为 `POST /__microwarp/api/v1/restart-schedule`：传入 `{"action":"pause"}` 暂停后续定时滚动重启，传入 `{"action":"resume"}` 恢复，传入 `{"action":"run-now"}` 可立即请求守护进程执行一轮。`run-now` 成功时返回 `202`，计划快照的 `status` 会先变为 `starting`，并带有 `run_now_requested=true`；守护进程取得调度锁后会原子消费请求并开始执行。已有轮次正在运行或存在未消费请求时，接口返回 `409` 以避免并发重复执行。立即执行沿用既有策略，且即使后续定时轮次已暂停也会执行当前请求，但不会恢复暂停状态。计划详情与执行结果同时包含在 `GET /__microwarp/api/v1/status` 的 `restart_schedule` 字段中。该接口不会在运行时修改周期、并发或延后队列复查配置；如需调整这些策略，请修改对应的 `ROTATE_RESTART_*` 环境变量后重建容器。
 
 管理操作采用可追踪任务闭环：接口的 `202` 响应会返回 `operation.operation_id`、动作、排队状态和开始时间；`GET /__microwarp/api/v1/status` 中的实例操作会持续返回阶段、消息、开始时间、已耗时和终态标记，繁忙的优雅重连、停用或临时实例移除会显示“等待自然空闲”、当前连接数与下次复查时间；批量增减还会返回总数、已处理、成功与失败数量。页面在存在任务时自动以 `1 秒` 刷新，完成或失败后给出明确结果；失败实例可直接重试或跳转到该实例的管理日志。若 WARP 探测达到 `MANAGEMENT_ACTION_PROBE_TIMEOUT`，会先记录 `warp-probe-timeout`；健康守护在后续探测中确认实例恢复并重新入池后，会将终态更新为 `recovered`（超时后已恢复），同时保留首次超时的时间、原因码、原因和超时后恢复等待时间，避免实际已健康但页面仍显示失败。优雅重连与停用的确认框会展示活跃连接数和队列策略；存在活跃连接时，强制重连必须勾选“我知道这会立即中断当前实例上的连接”才能提交。实例区支持按需要关注、操作中、健康、已停用和临时实例筛选；页面会展示数据新鲜度与刷新错误。日志区支持警告/错误筛选、暂停跟随时的新日志计数，并可从失败实例跳转到相关管理日志。
 
@@ -691,9 +697,9 @@ services:
 
 滚动重启会在每轮开始时快照当前基础实例和临时实例，并逐一判断是否可处理：仅健康状态为 `ready`、仍在后端池中，且未被手工停用、未执行管理操作、未处于其他重启流程的实例才会参与本轮分类。默认 `ROTATE_RESTART_CONCURRENCY=auto` 时，并行额度为 `max(1, floor(当前实例总数 / 5))`；例如 100 个实例会同时最多处理 20 个。可设置正整数显式覆盖，例如 `ROTATE_RESTART_CONCURRENCY=5`。
 
-调度器使用空闲优先的连续双队列：活跃连接数为 `0` 的实例进入就绪队列；仍有活跃连接的实例进入延后队列，保持在后端池中继续服务。延后队列按 `ROTATE_RESTART_DEFERRED_CHECK_INTERVAL`（默认 `60` 秒）在**同一轮滚动重启内**复查，连接自然归零后立即转入就绪队列；延后不是失败，也不会占用重启并行额度。调度器不是按固定分组等待：任一空闲实例完成或失败后，会立即从就绪队列补充下一个空闲实例，因此整个过程中在有待处理实例时始终尽量维持该并行数。真正回收前，实例会先从后端池摘流并再次确认活跃连接数仍为 `0`；若复核发现新连接，则立即恢复流量并转入延后队列。确认空闲后才执行重启、trace 验证 WARP 就绪和重新入池。定时滚动重启不会因连接排空超时而强制中断代理会话。
+调度器使用空闲优先的连续队列：活跃连接数为 `0` 的实例进入就绪队列；仍有活跃连接的实例进入延后队列，保持在后端池中继续服务。延后队列按 `ROTATE_RESTART_DEFERRED_CHECK_INTERVAL`（默认 `60` 秒）在**同一轮滚动重启内**复查，连接自然归零后立即转入就绪队列；延后不是失败，也不会占用重启并行额度。真正回收前，实例会先经统一的后端池请求通道登记 `down`，并在 `backends.meta` 与后端列表完成批量提交后才确认摘流；若请求暂未确认（例如批量提交者繁忙或遗留锁正在恢复），实例保持运行并进入独立的“后端池重试队列”，按 `1s`、`2s`、`5s`、`10s` 退避重试，**不会被混入连接延后队列，也不会在未确认摘流时重启或中断既有会话**。请求可能由另一提交者在稍后完成摘流；调度器会识别这个安全中间状态并在下一次重试中重新确认，而不会误判为“未入池”跳过。若摘流后复核发现新连接，则立即经同一通道恢复流量并转入连接延后队列。重试超过 `BACKEND_POOL_OPERATION_RETRY_LIMIT` 后才记录最终失败，失败原因会区分确认超时、并发状态冲突与更新异常。调度器不是按固定分组等待：任一空闲实例完成或失败后，会立即从就绪队列补充下一个空闲实例，因此整个过程中在有待处理实例时始终尽量维持该并行数。确认空闲和摘流后才执行重启、trace 验证 WARP 就绪和重新入池；定时滚动重启不会因连接排空超时而强制中断代理会话。
 
-管理页的定时重启卡会**持续显示**就绪队列数量、延后队列数量及延后队列下一次复查时间（没有待复查实例时明确显示 `0` 与“当前无待复查实例”）。可点击两个队列查看实例列表。最近执行存在失败时，可查看每个失败实例的阶段、原因码、可读原因、重试次数、活跃连接数和时间，并可复制诊断或跳转实例日志。最近 `ROTATE_RESTART_HISTORY_LIMIT`（默认 `20`）轮会保留成功/失败/跳过/延后数量、队列峰值、平均延后等待时间，以及成功率、失败数、延后数趋势；运行时目录会随容器重启清理。
+管理页的定时重启卡会**持续显示**就绪队列数量、连接延后队列数量及其下一次复查时间；实例当前操作会单独显示“等待后端池确认”及下一次控制面重试时间，因此不会把摘流确认问题伪装成连接未排空。可点击队列查看实例列表。最近执行存在失败时，可查看每个失败实例的阶段、原因码、可读原因、重试次数、活跃连接数和时间，并可复制诊断或跳转实例日志。最近 `ROTATE_RESTART_HISTORY_LIMIT`（默认 `20`）轮会保留成功/失败/跳过/延后/后端池重试数量、队列峰值、平均延后等待时间，以及成功率、失败数、延后数趋势；运行时目录会随容器重启清理。
 
 查看状态：
 

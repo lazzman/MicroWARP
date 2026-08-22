@@ -288,6 +288,35 @@ pending_update_count="$(find "$(backend_pending_dir)" -type f -name '[0-9]*' 2>/
     exit 1
 }
 
+# 破坏性操作通过 pool 同步入口时，不能仅因请求已经落盘就返回成功；必须等到
+# backends.meta 确认目标状态。超时请求保留，后续提交者可继续合并并完成确认。
+INSTANCE_COUNT=2
+printf '0=up\n1=up\n' > "$BACKENDS_META_FILE"
+mkdir "$(backend_lock_dir)"
+printf '%s\n' "$$" > "$(backend_lock_dir)/owner"
+BACKEND_POOL_LOCK_TIMEOUT=1
+if update_backend 0 down confirmed; then
+    printf '断言失败：持有后端池锁时同步确认不应提前成功\n' >&2
+    exit 1
+else
+    update_exit="$?"
+fi
+[[ "$update_exit" = 75 ]] || {
+    printf '断言失败：同步确认超时应返回 75，实际=%s\n' "$update_exit" >&2
+    exit 1
+}
+pending_update_count="$(find "$(backend_pending_dir)" -type f -name '[0-9]*' 2>/dev/null | wc -l | tr -d ' ')"
+[[ "$pending_update_count" -ge 1 ]] || {
+    printf '断言失败：同步确认超时后必须保留后端池请求\n' >&2
+    exit 1
+}
+rm -rf "$(backend_lock_dir)"
+update_backend 0 down confirmed
+[[ "$(backend_pool_state 0)" = down ]] || {
+    printf '断言失败：后续提交者应合并保留的摘流请求\n' >&2
+    exit 1
+}
+
 STATUS_EVENT_LOG=0
 printf 'failed failures=3 checked_at=103\n' > "$(state_file 1)"
 printf '1=down\n' >> "$BACKENDS_META_FILE"

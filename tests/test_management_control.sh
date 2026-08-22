@@ -79,6 +79,23 @@ assert_contains '强制重连停止实例' "$(cat "$calls")" 'stop:0'
 assert_contains '强制重连启动实例' "$(cat "$calls")" 'start:0'
 assert_contains '强制重连探测' "$(cat "$calls")" 'probe'
 
+# 后端池同步确认暂时失败时，管理操作应保留实例并退避重试；短暂竞争不能直接
+# 变成 backend-drain-failed，更不能在未确认摘流时提前停止实例。
+: > "$calls"
+pool_attempt=0
+set_pool() {
+    pool_attempt=$((pool_attempt + 1))
+    printf 'pool:%s:%s\n' "$1" "$pool_attempt" >> "$calls"
+    [[ "$pool_attempt" -gt 1 ]]
+}
+BACKEND_RETRY_LIMIT=1
+BACKEND_RETRY_MAX_DELAY=1
+ACTION=force-reconnect
+force_reconnect_instance
+assert_contains '强制重连摘流确认重试' "$(cat "$calls")" 'pool:down:2'
+assert_contains '强制重连确认后才停止实例' "$(cat "$calls")" 'stop:0'
+assert_not_contains '短暂后端池竞争不得记录最终失败' "$(cat "$(operation_file)")" 'status=failed'
+
 # 手工停用实例不允许两种重连，必须先显式启用。
 touch "$(disabled_file)"
 if reconnect_instance >/dev/null 2>&1; then

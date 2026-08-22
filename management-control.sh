@@ -16,10 +16,18 @@ CONNECTION_FILE="${LB_CONNECTION_STATE_FILE:-${RUNTIME_ROOT}/lb-connections.txt}
 PROBE_TIMEOUT="${MANAGEMENT_ACTION_PROBE_TIMEOUT:-180}"
 # 与定时滚动重启共用的延后队列复查间隔；繁忙实例保持服务，不会被超时强制中断。
 DEFERRED_CHECK_INTERVAL="${ROTATE_RESTART_DEFERRED_CHECK_INTERVAL:-60}"
+# 摘流/恢复是破坏性操作的前置条件：若统一后端池提交通道暂未确认，管理操作
+# 保持实例运行并进行有界退避重试，而不是把“控制面暂忙”误报为最终失败。
+BACKEND_RETRY_LIMIT="${BACKEND_POOL_OPERATION_RETRY_LIMIT:-6}"
+BACKEND_RETRY_MAX_DELAY="${BACKEND_POOL_OPERATION_RETRY_MAX_DELAY:-10}"
 # 由控制面为一次异步请求生成；同一批扩缩容子操作会共享该 ID，便于页面追踪。
 OPERATION_ID="${MANAGEMENT_OPERATION_ID:-}"
 OPERATION_STARTED_AT="${MANAGEMENT_OPERATION_STARTED_AT:-$(date +%s)}"
 OPERATION_FAILURE_RECORDED=0
+BACKEND_POOL_LAST_FAILURE_CODE=""
+
+[[ "$BACKEND_RETRY_LIMIT" =~ ^[0-9]+$ ]] || BACKEND_RETRY_LIMIT=6
+[[ "$BACKEND_RETRY_MAX_DELAY" =~ ^[0-9]+$ ]] && [[ "$BACKEND_RETRY_MAX_DELAY" -ge 1 ]] || BACKEND_RETRY_MAX_DELAY=10
 
 log() { mw_info "管理" "$*"; }
 ok() { mw_ok "管理" "$*"; }
@@ -95,6 +103,45 @@ deferred_check_seconds() {
     printf '%s\n' "$seconds"
 }
 
+backend_retry_delay_seconds() {
+    local attempt="$1" delay
+    case "$attempt" in
+        1) delay=1 ;;
+        2) delay=2 ;;
+        3) delay=5 ;;
+        *) delay=10 ;;
+    esac
+    [[ "$delay" -le "$BACKEND_RETRY_MAX_DELAY" ]] || delay="$BACKEND_RETRY_MAX_DELAY"
+    printf '%s\n' "$delay"
+}
+
+set_pool_with_retry() {
+    local target_state="$1" purpose="$2" phase="$3" attempt=0 delay active exit_status
+    BACKEND_POOL_LAST_FAILURE_CODE=""
+    while true; do
+        if set_pool "$target_state"; then
+            return 0
+        else
+            exit_status=$?
+        fi
+        case "$exit_status" in
+            75) BACKEND_POOL_LAST_FAILURE_CODE="backend-pool-confirm-timeout" ;;
+            76) BACKEND_POOL_LAST_FAILURE_CODE="backend-pool-state-conflict" ;;
+            *) BACKEND_POOL_LAST_FAILURE_CODE="backend-pool-update-failed" ;;
+        esac
+        attempt=$((attempt + 1))
+        if [[ "$attempt" -gt "$BACKEND_RETRY_LIMIT" ]]; then
+            warn "实例=${INSTANCE_ID} ${purpose}后端池更新重试预算耗尽 | 状态=${target_state} | 原因=${BACKEND_POOL_LAST_FAILURE_CODE}"
+            return "$exit_status"
+        fi
+        delay="$(backend_retry_delay_seconds "$attempt")"
+        active="$(active_connections)"
+        write_operation "backend-retry" "后端池${target_state} 状态暂未确认，保持实例运行（既有连接不主动中断）并在 ${delay} 秒后重试（第 ${attempt}/${BACKEND_RETRY_LIMIT} 次）" "$active" "$(( $(date +%s) + delay ))" "$phase" "$BACKEND_POOL_LAST_FAILURE_CODE"
+        warn "实例=${INSTANCE_ID} ${purpose}后端池更新未确认，${delay}s 后重试 | 次数=${attempt}/${BACKEND_RETRY_LIMIT} | 原因=${BACKEND_POOL_LAST_FAILURE_CODE}"
+        sleep "$delay"
+    done
+}
+
 wait_until_idle() {
     local purpose="$1" active seconds next_check_at
     seconds="$(deferred_check_seconds)"
@@ -115,8 +162,8 @@ claim_idle_backend() {
     while true; do
         wait_until_idle "$purpose"
         write_operation "claiming" "已确认空闲，正在摘流并复核连接" "" "" "backend-drain"
-        if ! set_pool down; then
-            record_failure "backend-drain" "backend-drain-failed" "无法将实例从后端池摘流"
+        if ! set_pool_with_retry down "$purpose" "backend-drain"; then
+            record_failure "backend-drain" "${BACKEND_POOL_LAST_FAILURE_CODE:-backend-pool-update-failed}" "无法确认实例已从后端池摘流"
             return 1
         fi
         # 摘流与首次检查之间可能刚好建立新连接；恢复流量后重新进入延后队列。
@@ -125,8 +172,8 @@ claim_idle_backend() {
             return 0
         fi
         warn "实例=${INSTANCE_ID} ${purpose}摘流复核发现 ${active} 条活跃连接，恢复流量并延后"
-        if ! set_pool up; then
-            record_failure "backend-restore" "backend-restore-failed" "摘流复核发现新连接后，无法恢复实例流量"
+        if ! set_pool_with_retry up "$purpose" "backend-restore"; then
+            record_failure "backend-restore" "${BACKEND_POOL_LAST_FAILURE_CODE:-backend-pool-update-failed}" "摘流复核发现新连接后，无法确认实例已恢复后端池流量"
             return 1
         fi
     done
@@ -348,9 +395,9 @@ force_reconnect_instance() {
     }
     touch "$(restarting_file)"
     # 先摘流以避免新会话继续进入该实例；随后立即停止，现有连接会被中断。
-    write_operation "reconnecting" "已摘流，正在强制重建 WARP 连接（现有连接将中断）" "" "" "reconnect"
-    if ! set_pool down; then
-        record_failure "backend-drain" "backend-drain-failed" "无法将实例从后端池摘流"
+    write_operation "reconnecting" "正在从后端池摘流，随后强制重建 WARP 连接（现有连接将中断）" "" "" "backend-drain"
+    if ! set_pool_with_retry down "强制重连" "backend-drain"; then
+        record_failure "backend-drain" "${BACKEND_POOL_LAST_FAILURE_CODE:-backend-pool-update-failed}" "无法确认实例已从后端池摘流"
         return 1
     fi
     if ! stop_instance "$INSTANCE_ID"; then
