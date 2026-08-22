@@ -59,6 +59,21 @@ assert_contains '已入池状态' "$table" '🟢 已入池'
 assert_contains '摘流状态' "$table" '⚪ 摘流'
 assert_contains '汇总图标' "$table" '📦 汇总 | ✅ 就绪=1 ⏳ 等待=1'
 
+# 手工与计划重启共用 ready 完成条件：即使检查函数刚写入 ready，也必须通过
+# 同步确认的 up 提交后才返回成功，不能把旧状态或异步请求误报为已恢复。
+ready_confirmation_log="$workdir/ready-confirmations.log"
+(
+    check_one() {
+        printf 'ready checked_at=200\n' > "$(state_file 0)"
+    }
+    update_backend() {
+        printf 'id=%s state=%s mode=%s\n' "$1" "$2" "${3:-async}" >> "$ready_confirmation_log"
+        [[ "$1" = 0 && "$2" = up && "${3:-async}" = confirmed ]]
+    }
+    confirm_warp_ready 0
+)
+assert_contains 'ready 完成条件同步确认后端池' "$(cat "$ready_confirmation_log")" 'id=0 state=up mode=confirmed'
+
 # checked_at 改变不属于可见状态变化，不能重复输出表格。
 printf 'ready ip=2a09:bac5::1 ip4=198.51.100.1 ip6=2a09:bac5::1 warp=on loc=US colo=SJC checked_at=101\n' > "$(state_file 0)"
 printf 'waiting checked_at=101\n' > "$(state_file 1)"

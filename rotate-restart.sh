@@ -22,8 +22,14 @@ ENABLED="${ROTATE_RESTART_ENABLED:-auto}"
 INTERVAL="${ROTATE_RESTART_INTERVAL:-6h}"
 PROBE_TIMEOUT="${ROTATE_RESTART_PROBE_TIMEOUT:-90}"
 RETRIES="${ROTATE_RESTART_RETRIES:-2}"
-# auto 表示按当前实例总数的 1/5 并行，至少一个；可设置正整数显式覆盖。
+# 与手工管理操作共享的 WARP 就绪复查节奏。两条路径必须使用同一个“探测成功
+# 且确认入池”完成条件，避免页面看到的恢复时间不可比较。
+RECOVERY_PROBE_INTERVAL="${RESTART_RECOVERY_PROBE_INTERVAL:-3}"
+# auto 表示按当前实例总数的 1/5 并行，至少一个；可设置正整数请求并行数。
 CONCURRENCY="${ROTATE_RESTART_CONCURRENCY:-auto}"
+# 不论 auto 计算结果还是显式请求值，都受该上限保护，避免大规模实例轮次
+# 同时摘流、重启和探测而形成控制面尖峰。
+MAX_CONCURRENCY="${ROTATE_RESTART_MAX_CONCURRENCY:-10}"
 # 繁忙实例保留服务并进入延后队列；默认每分钟重新检查一次连接数。
 DEFERRED_CHECK_INTERVAL="${ROTATE_RESTART_DEFERRED_CHECK_INTERVAL:-60}"
 # 后端池同步确认暂时失败时，不把空闲实例误归为“连接延后”，而是在本轮内走
@@ -34,6 +40,8 @@ BACKEND_RETRY_MAX_DELAY="${BACKEND_POOL_OPERATION_RETRY_MAX_DELAY:-10}"
 # 每轮结果和失败明细仅保留最近若干轮，避免运行时目录无限增长。
 HISTORY_LIMIT="${ROTATE_RESTART_HISTORY_LIMIT:-20}"
 [[ "$HISTORY_LIMIT" =~ ^[0-9]+$ ]] && [[ "$HISTORY_LIMIT" -ge 1 ]] || HISTORY_LIMIT=20
+[[ "$MAX_CONCURRENCY" =~ ^[0-9]+$ ]] && [[ "$MAX_CONCURRENCY" -ge 1 ]] || MAX_CONCURRENCY=10
+[[ "$RECOVERY_PROBE_INTERVAL" =~ ^[0-9]+$ ]] && [[ "$RECOVERY_PROBE_INTERVAL" -ge 1 ]] || RECOVERY_PROBE_INTERVAL=3
 [[ "$BACKEND_RETRY_LIMIT" =~ ^[0-9]+$ ]] || BACKEND_RETRY_LIMIT=6
 [[ "$BACKEND_RETRY_MAX_DELAY" =~ ^[0-9]+$ ]] && [[ "$BACKEND_RETRY_MAX_DELAY" -ge 1 ]] || BACKEND_RETRY_MAX_DELAY=10
 # 以下两个覆盖项仅供隔离测试使用；正常容器保持默认的应用脚本路径。
@@ -161,6 +169,14 @@ effective_concurrency() {
             ;;
     esac
     [[ "$value" -le "$total" ]] || value="$total"
+    if [[ "$value" -gt "$MAX_CONCURRENCY" ]]; then
+        # auto 被上限收敛是预期行为；只有显式超额配置才记录提醒。
+        case "$requested" in
+            auto|'') ;;
+            *) warn "请求的滚动重启并行数超过上限，已限制 | 请求=${value} | 上限=${MAX_CONCURRENCY}" >&2 ;;
+        esac
+        value="$MAX_CONCURRENCY"
+    fi
     printf '%s\n' "$value"
 }
 
@@ -251,8 +267,8 @@ write_run_history_summary() {
             "$SCHEDULE_LAST_SKIPPED" "$SCHEDULE_LAST_DEFERRED"
         printf 'max_queued=%s\nmax_deferred=%s\navg_deferred_wait_seconds=%s\n' \
             "$SCHEDULE_LAST_MAX_QUEUED" "$SCHEDULE_LAST_MAX_DEFERRED" "$SCHEDULE_LAST_AVG_DEFERRED_WAIT_SECONDS"
-        printf 'configured_concurrency=%s\ndeferred_check_interval_seconds=%s\n' \
-            "$CONCURRENCY" "$SCHEDULE_DEFERRED_CHECK_INTERVAL_SECONDS"
+        printf 'configured_concurrency=%s\nconfigured_max_concurrency=%s\ndeferred_check_interval_seconds=%s\n' \
+            "$CONCURRENCY" "$MAX_CONCURRENCY" "$SCHEDULE_DEFERRED_CHECK_INTERVAL_SECONDS"
     } > "$temporary"
     mv "$temporary" "$target"
 }
@@ -350,7 +366,7 @@ write_schedule_state() {
             "$SCHEDULE_LAST_RUN_AT" "$SCHEDULE_LAST_COMPLETED_AT" "$SCHEDULE_LAST_DURATION_SECONDS" "$SCHEDULE_LAST_STATUS" \
             "$SCHEDULE_LAST_TOTAL" "$SCHEDULE_LAST_SUCCEEDED" "$SCHEDULE_LAST_FAILED" "$SCHEDULE_LAST_SKIPPED" \
             "$SCHEDULE_LAST_DEFERRED" "$SCHEDULE_LAST_BACKEND_RETRY" "$SCHEDULE_LAST_MAX_QUEUED" "$SCHEDULE_LAST_MAX_DEFERRED" "$SCHEDULE_LAST_MAX_BACKEND_RETRY" "$SCHEDULE_LAST_AVG_DEFERRED_WAIT_SECONDS"
-        printf 'configured_concurrency=%s\nhistory_limit=%s\nupdated_at=%s\n' "$CONCURRENCY" "$HISTORY_LIMIT" "$(date +%s)"
+        printf 'configured_concurrency=%s\nconfigured_max_concurrency=%s\nhistory_limit=%s\nupdated_at=%s\n' "$CONCURRENCY" "$MAX_CONCURRENCY" "$HISTORY_LIMIT" "$(date +%s)"
     } > "$temporary"
     mv "$temporary" "$SCHEDULE_STATE_FILE"
 }
@@ -560,16 +576,22 @@ clear_rotation_state() {
 }
 
 probe_ready() {
-    local id="$1" started_at="$2" attempt="$3" total_attempts="$4" deadline
+    local id="$1" started_at="$2" attempt="$3" total_attempts="$4" deadline now remaining probe_count=0
     deadline=$(( $(date +%s) + PROBE_TIMEOUT ))
     write_rotation_state "$id" "probing" "正在等待 WARP 健康探测（第 ${attempt}/${total_attempts} 次）" "$started_at" "" "$attempt" "$total_attempts"
     while [[ "$(date +%s)" -lt "$deadline" ]]; do
-        # 复用健康守护的双栈探测与状态写入，避免滚动重启覆盖 ip4/ip6 元数据。
-        if MANAGEMENT_FORCE_PROBE=1 "$HEALTH_CHECK" probe "$id" >/dev/null 2>&1; then
+        probe_count=$((probe_count + 1))
+        # ready 是计划与手工重连共享的恢复完成条件：主 WARP 探测通过后，必须
+        # 同步确认 up 已在后端池提交。诊断输出写入本轮 rotate.log。
+        if MANAGEMENT_FORCE_PROBE=1 "$HEALTH_CHECK" ready "$id" >>"${RUNTIME_ROOT}/rotate.log" 2>&1; then
             return 0
         fi
-        sleep 3
+        now="$(date +%s)"
+        remaining=$((deadline - now))
+        [[ "$remaining" -gt 0 ]] || break
+        [[ "$remaining" -le "$RECOVERY_PROBE_INTERVAL" ]] && sleep "$remaining" || sleep "$RECOVERY_PROBE_INTERVAL"
     done
+    warn "实例=${id} WARP 恢复确认超时 | 尝试=${attempt}/${total_attempts} | 主探测次数=${probe_count} | 等待上限=${PROBE_TIMEOUT}s"
     return 1
 }
 
@@ -1251,7 +1273,7 @@ daemon() {
     [[ "$seconds" -ge 60 ]] || seconds=60
     SCHEDULE_INTERVAL_SECONDS="$seconds"
     mw_section "滚动重启" "滚动重启守护已启动"
-    mw_info "滚动重启" "配置 | 实例=${INSTANCE_COUNT} | 间隔=${seconds}s | 策略=空闲优先、繁忙延后 | 探测=${PROBE_TIMEOUT}s | 重试=${RETRIES} | 并行=${CONCURRENCY}"
+    mw_info "滚动重启" "配置 | 实例=${INSTANCE_COUNT} | 间隔=${seconds}s | 策略=空闲优先、繁忙延后 | 探测=${PROBE_TIMEOUT}s | 重试=${RETRIES} | 并行请求=${CONCURRENCY} | 并行上限=${MAX_CONCURRENCY}"
     while true; do
         # 先处理显式请求，保证暂停自动计划时仍可手工立即执行一轮。
         if schedule_run_now_requested; then
@@ -1308,7 +1330,7 @@ status() {
         [[ "$id" =~ ^[0-9]+$ ]] && total=$((total + 1))
     done < <(runtime_instance_ids)
     concurrency="$(effective_concurrency "$total")"
-    echo "enabled=${ENABLED} instances=${total} interval=${INTERVAL} concurrency=${concurrency} configured_concurrency=${CONCURRENCY}"
+    echo "enabled=${ENABLED} instances=${total} interval=${INTERVAL} concurrency=${concurrency} configured_concurrency=${CONCURRENCY} configured_max_concurrency=${MAX_CONCURRENCY}"
     [[ -d "$LOCK_DIR" ]] && echo "running=yes" || echo "running=no"
     schedule_paused && echo "paused=yes" || echo "paused=no"
 }

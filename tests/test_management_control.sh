@@ -25,7 +25,6 @@ start_instance() { printf 'start:%s\n' "$1" >> "$calls"; }
 stop_instance() { printf 'stop:%s\n' "$1" >> "$calls"; }
 set_pool() { printf 'pool:%s\n' "$1" >> "$calls"; }
 wait_until_idle() { printf 'idle:%s\n' "$1" >> "$calls"; }
-wait_ready() { printf 'probe\n' >> "$calls"; return 0; }
 
 assert_contains() {
     local title="$1" text="$2" expected="$3"
@@ -45,6 +44,33 @@ assert_not_contains() {
 
 INSTANCE_ID=0
 mkdir -p "$(runtime_dir)"
+
+# 管理操作必须调用 ready，而不是只读旧的 probe 状态；ready 是“重新探测 WARP
+# 并同步确认后端池 up”的统一完成条件。这样手工与计划重启才能比较恢复耗时。
+recovery_calls="${workdir}/recovery-calls.log"
+cat > "${workdir}/health-ready.sh" <<'SH'
+#!/usr/bin/env bash
+printf '%s id=%s force=%s\n' "$1" "$2" "${MANAGEMENT_FORCE_PROBE:-0}" >> "${RECOVERY_CALLS:?}"
+[[ "$1" = ready && "$2" = 0 && "${MANAGEMENT_FORCE_PROBE:-0}" = 1 ]]
+SH
+chmod +x "${workdir}/health-ready.sh"
+HEALTH_CHECK_COMMAND="${workdir}/health-ready.sh"
+RECOVERY_CALLS="$recovery_calls"
+export RECOVERY_CALLS
+PROBE_TIMEOUT=2
+RECOVERY_PROBE_INTERVAL=1
+ACTION=reconnect
+write_operation "running" "测试恢复确认" "" "" "received"
+wait_ready
+assert_contains '恢复确认调用 ready' "$(cat "$recovery_calls")" 'ready id=0 force=1'
+operation_state="$(cat "$(operation_file)")"
+assert_contains '恢复确认写入重新入池阶段' "$operation_state" 'phase=pool-rejoin'
+assert_contains '恢复确认记录 WARP 就绪时间' "$operation_state" 'warp_ready_at='
+assert_contains '恢复确认记录重新入池时间' "$operation_state" 'pool_rejoined_at='
+rm -f "$(operation_file)"
+
+# 后续状态机用桩函数隔离生命周期命令；上面的用例已覆盖真实 wait_ready 路径。
+wait_ready() { printf 'probe\n' >> "$calls"; return 0; }
 
 ACTION=disable
 disable_instance
@@ -148,6 +174,13 @@ finished_at=$(( $(date +%s) - 10 ))
 duration_seconds=180
 phase=warp-probe
 reason_code=warp-probe-timeout
+backend_drained_at=$(( $(date +%s) - 185 ))
+instance_stop_started_at=$(( $(date +%s) - 184 ))
+instance_stopped_at=$(( $(date +%s) - 183 ))
+instance_start_started_at=$(( $(date +%s) - 182 ))
+instance_started_at=$(( $(date +%s) - 181 ))
+warp_probe_started_at=$(( $(date +%s) - 180 ))
+probe_timed_out_at=$(( $(date +%s) - 10 ))
 STATE
 export HEALTH_CHECK_LIB_ONLY=1
 # shellcheck source=../health-check.sh
@@ -165,6 +198,11 @@ assert_contains '延迟恢复阶段' "$operation_state" 'phase=recovered'
 assert_contains '保留首次超时原因码' "$operation_state" 'timeout_reason_code=warp-probe-timeout'
 assert_contains '保留首次超时原因' "$operation_state" 'timeout_message=在 180 秒内未确认 WARP 已就绪'
 assert_contains '记录最终恢复时间' "$operation_state" 'recovered_at='
+assert_contains '保留摘流阶段时间' "$operation_state" 'backend_drained_at='
+assert_contains '保留停止阶段时间' "$operation_state" 'instance_stopped_at='
+assert_contains '保留启动阶段时间' "$operation_state" 'instance_started_at='
+assert_contains '保留主动确认超时时间' "$operation_state" 'probe_timed_out_at='
+assert_contains '记录健康守护恢复时间' "$operation_state" 'health_recovered_at='
 assert_not_contains '恢复状态不再保留当前失败原因码' "$operation_state" $'\nreason_code='
 
 echo '管理实例控制测试通过'

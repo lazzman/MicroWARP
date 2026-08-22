@@ -39,6 +39,40 @@ def receive_exact(sock: socket.socket, size: int) -> bytes:
     return bytes(received)
 
 
+class RestartSchedulePolicyTests(unittest.TestCase):
+    """验证管理页面与调度器使用相同的滚动重启并行上限语义。"""
+
+    def test_restart_schedule_concurrency_honors_hard_cap(self) -> None:
+        """自动计算和显式请求值都不得绕过 10 个实例的默认硬上限。"""
+        with mock.patch.dict(
+            os.environ,
+            {
+                "ROTATE_RESTART_CONCURRENCY": "auto",
+                "ROTATE_RESTART_MAX_CONCURRENCY": "10",
+            },
+            clear=False,
+        ):
+            self.assertEqual(LB_MODULE.restart_schedule_concurrency(100), 10)
+        with mock.patch.dict(
+            os.environ,
+            {
+                "ROTATE_RESTART_CONCURRENCY": "50",
+                "ROTATE_RESTART_MAX_CONCURRENCY": "10",
+            },
+            clear=False,
+        ):
+            self.assertEqual(LB_MODULE.restart_schedule_concurrency(100), 10)
+        with mock.patch.dict(
+            os.environ,
+            {
+                "ROTATE_RESTART_CONCURRENCY": "5",
+                "ROTATE_RESTART_MAX_CONCURRENCY": "10",
+            },
+            clear=False,
+        ):
+            self.assertEqual(LB_MODULE.restart_schedule_concurrency(100), 5)
+
+
 class SocksEchoBackend:
     """仅用于验证 LB 是否以 SOCKS5 连接内部后端并保留转发数据。"""
 
@@ -567,6 +601,9 @@ class MixedLoadBalancerTests(unittest.TestCase):
                 "ROTATE_RESTART_INTERVAL": "6h",
                 "ROTATE_RESTART_CONCURRENCY": "2",
                 "ROTATE_RESTART_DEFERRED_CHECK_INTERVAL": "1m",
+                "MANAGEMENT_IDLE_CHECK_INTERVAL": "3",
+                "RESTART_RECOVERY_PROBE_INTERVAL": "3",
+                "MANAGEMENT_ACTION_PROBE_TIMEOUT": "90",
             }
         )
         self.assertIsNotNone(self.lb)
@@ -649,6 +686,7 @@ class MixedLoadBalancerTests(unittest.TestCase):
         self.assertIn(b"requiresAck=force&&Number(item.active_connections||0)>0", body)
         self.assertIn(b"terminalStatuses=new Set(['success','failed','partial','cancelled','recovered'])", body)
         self.assertIn("超时后已恢复".encode("utf-8"), body)
+        self.assertIn("管理主动确认超时".encode("utf-8"), body)
         self.assertIn("健康守护恢复".encode("utf-8"), body)
         self.assertIn(b"impact.hidden=!requiresAck", body)
         self.assertIn(b"ack.hidden=!requiresAck", body)
@@ -663,6 +701,8 @@ class MixedLoadBalancerTests(unittest.TestCase):
         self.assertIn(b"operation-detail-row", body)
         self.assertIn(b"function operationRecovered(item)", body)
         self.assertIn(b"function operationTimingText(operation)", body)
+        self.assertIn(b"function operationMilestoneFields(current)", body)
+        self.assertIn("后端池重新入池确认".encode("utf-8"), body)
         self.assertIn("查看失败原因与本次日志".encode("utf-8"), body)
         # 紧凑表格在常见桌面宽度下不需要横向滚动；操作列保留重连和停用两个图标。
         self.assertIn(b".canvas-app .instance-table{width:100%;min-width:1120px;table-layout:fixed}", body)
@@ -713,8 +753,12 @@ class MixedLoadBalancerTests(unittest.TestCase):
         self.assertEqual(schedule["last_result"]["duration_seconds"], 60)
         self.assertEqual(schedule["last_result"]["deferred"], 0)
         self.assertIn("management", payload)
-        self.assertEqual(payload["management"]["deferred_check_interval"], "1m")
-        self.assertEqual(payload["management"]["deferred_check_interval_seconds"], 60)
+        # 手工优雅操作的复查周期独立于计划滚动重启的 1 分钟延后队列。
+        self.assertEqual(payload["management"]["deferred_check_interval"], "3")
+        self.assertEqual(payload["management"]["deferred_check_interval_seconds"], 3)
+        self.assertEqual(payload["management"]["idle_check_interval"], "3")
+        self.assertEqual(payload["management"]["recovery_probe_interval"], "3")
+        self.assertEqual(payload["management"]["action_probe_timeout"], 90)
         self.assertEqual(payload["management"]["max_instance_count"], 255)
 
         pause_body = json.dumps({"action": "pause"}).encode("utf-8")
@@ -1186,6 +1230,11 @@ class ManagementOperationTests(unittest.TestCase):
                 "duration_seconds": "90",
                 "phase": "warp-probe",
                 "reason_code": "warp-probe-timeout",
+                "backend_drained_at": "111",
+                "instance_stopped_at": "120",
+                "instance_started_at": "140",
+                "warp_probe_started_at": "145",
+                "probe_timed_out_at": "190",
             }
         )
         self.assertTrue(operation["terminal"])
@@ -1194,6 +1243,11 @@ class ManagementOperationTests(unittest.TestCase):
         self.assertEqual(operation["elapsed_seconds"], 90)
         self.assertEqual(operation["phase"], "warp-probe")
         self.assertEqual(operation["reason_code"], "warp-probe-timeout")
+        self.assertEqual(operation["backend_drained_at"], 111)
+        self.assertEqual(operation["instance_stopped_at"], 120)
+        self.assertEqual(operation["instance_started_at"], 140)
+        self.assertEqual(operation["warp_probe_started_at"], 145)
+        self.assertEqual(operation["probe_timed_out_at"], 190)
 
     def test_timed_out_management_operation_reports_late_recovery(self) -> None:
         """超时后由健康守护恢复时，状态接口必须明确给出最终恢复与首次超时诊断。"""

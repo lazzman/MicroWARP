@@ -198,7 +198,8 @@ docker compose up -d
 | `LB_ACCESS_LOG_HEADERS` | `1` | Effective when `LB_ACCESS_LOG=1`. `1` logs all parseable HTTP proxy request headers, while credential-bearing values (`Authorization`, `Proxy-Authorization`, `Cookie`, `Token`, API keys, and similar) are always redacted. `0` records no header content and marks the access line as `HTTP头=已关闭`, while retaining request-line metadata. For HTTP `CONNECT`, only the plaintext CONNECT handshake headers are visible; HTTPS headers inside the tunnel cannot be decoded. |
 | `LB_ACCESS_LOG_HEADER_MAX_CHARS` | `8192` | Maximum characters written for the HTTP-header field of one access-log line; accepts `256`–`65536`. Oversized header blocks are marked as truncated. |
 | `MANAGEMENT_UI_ENABLED` | `0` | `1` enables the unauthenticated management page at `http://<host>:<BIND_PORT>/__microwarp/`, reusing the sole listener. It forces the built-in LB and control plane even in direct single-instance SOCKS5 mode. |
-| `MANAGEMENT_ACTION_PROBE_TIMEOUT` | `180` | 启用或任一重连操作启动后，等待 WARP 健康探测成功的最长秒数。超过该时间后实例保持摘流，并由健康守护继续恢复。 |
+| `MANAGEMENT_ACTION_PROBE_TIMEOUT` | `90` | 手工启用或任一重连操作启动后，等待“WARP 主探测通过且后端池同步确认 `up`”的最长秒数。默认值与计划滚动重启一致；超时后实例保持摘流，并由健康守护继续恢复。 |
+| `MANAGEMENT_IDLE_CHECK_INTERVAL` | `3` | 手工优雅重连、停用和移除在存在活跃连接时的复查间隔（秒或 `1m` 等时长）。只影响手工空闲优先队列，不再复用计划滚动重启的延后队列周期。 |
 | `LB_IDLE_TIMEOUT` | `600` | Bidirectional no-traffic timeout in seconds for the built-in front end, not a maximum connection lifetime. Any client or backend bytes reset it. The higher default prevents a slow LLM first token or an inter-token pause from being cut off; use a positive value and do not use `0` / a negative value as a disable switch. |
 | `LB_HANDSHAKE_TIMEOUT` | `30` | SOCKS5 / HTTP proxy handshake timeout in seconds. |
 | `INTERNAL_PROXY_PORT` | `1081` | **Advanced.** Internal backend port used only for single-instance Mixed/LB; it is never published. Usually leave unchanged. |
@@ -223,10 +224,12 @@ docker compose up -d
 | `STATUS_EVENT_LOG` | `1` | `1` prints a complete icon status table on initial observation and when an instance readiness, egress IP/location (`loc` / `colo`), pool, or maintenance state changes. Each ready row includes separate IPv4 and IPv6 exits plus active connections currently forwarded by the built-in LB; the lightweight single-instance direct path shows `—` for connection count because microsocks/usque has no control-plane counter. `0` disables only this table. |
 | `ROTATE_RESTART_ENABLED` | `auto` | `auto` enables rolling restart only with four or more instances; `1` forces it for a multi-instance deployment and `0` disables it. |
 | `ROTATE_RESTART_INTERVAL` | `6h` | Interval between rolling restarts; accepts seconds or a duration such as `6h`. |
-| `ROTATE_RESTART_PROBE_TIMEOUT` | `90` | Maximum seconds to wait for a restarted instance to pass its WARP probe. |
+| `ROTATE_RESTART_PROBE_TIMEOUT` | `90` | Maximum seconds to wait for a restarted instance to pass the shared WARP-ready-and-pool-rejoin confirmation. |
+| `RESTART_RECOVERY_PROBE_INTERVAL` | `3` | Seconds between shared recovery confirmations for scheduled and manual restarts. Each confirmation requires a fresh WARP probe plus a synchronous `up` commit to the backend pool. |
 | `ROTATE_RESTART_RETRIES` | `2` | Retry count when a rolling-restarted instance does not become ready. |
-| `ROTATE_RESTART_CONCURRENCY` | `auto` | `auto` sets the concurrency budget to `max(1, floor(current instance count / 5))` (20 for 100 instances). A positive integer explicitly overrides it; a completed idle instance immediately admits the next idle instance. Busy instances do not occupy this budget. |
-| `ROTATE_RESTART_DEFERRED_CHECK_INTERVAL` | `60` | Interval for rechecking busy instances in the deferred queue. Accepts seconds or durations such as `1m`; the default checks once per minute. It applies to scheduled rolling restarts and manual graceful actions. |
+| `ROTATE_RESTART_CONCURRENCY` | `auto` | Requested concurrency. `auto` calculates `max(1, floor(current instance count / 5))`; both `auto` and explicit values are limited by `ROTATE_RESTART_MAX_CONCURRENCY`. A completed idle instance immediately admits the next idle instance. Busy instances do not occupy this budget. |
+| `ROTATE_RESTART_MAX_CONCURRENCY` | `10` | Hard ceiling for actual rolling-restart concurrency. This protects the control plane and upstream from a large simultaneous drain/restart/probe burst, even when `ROTATE_RESTART_CONCURRENCY` is set higher. |
+| `ROTATE_RESTART_DEFERRED_CHECK_INTERVAL` | `60` | Interval for rechecking busy instances in the **scheduled rolling-restart** deferred queue. Accepts seconds or durations such as `1m`; the default checks once per minute. Manual graceful actions use `MANAGEMENT_IDLE_CHECK_INTERVAL` instead. |
 | `ROTATE_RESTART_HISTORY_LIMIT` | `20` | 管理页面保留的最近定时滚动重启轮次数；每轮保存摘要、失败原因、重试/阶段及跳过诊断到运行时目录。 |
 
 #### Upstream SOCKS5 for WARP registration and outer transport
@@ -491,7 +494,8 @@ docker compose up -d
 | `LB_ACCESS_LOG_HEADERS` | `1` | 仅在 `LB_ACCESS_LOG=1` 时生效。`1` 记录全部可解析的 HTTP 代理请求头；`Authorization`、`Proxy-Authorization`、`Cookie`、Token、API Key 等敏感字段值始终脱敏。`0` 不记录任何请求头内容，但会标注 `HTTP头=已关闭`，并保留请求行元数据。HTTP `CONNECT` 只能看到明文 CONNECT 握手头，无法解密隧道内 HTTPS 请求头。 |
 | `LB_ACCESS_LOG_HEADER_MAX_CHARS` | `8192` | 单条访问日志中 HTTP 请求头字段的最大字符数，范围 `256`–`65536`；超出时会标记为截断。 |
 | `MANAGEMENT_UI_ENABLED` | `0` | `1` 启用匿名管理页面 `http://<宿主机>:<BIND_PORT>/__microwarp/`，复用唯一监听端口。即使原本是单实例直接 SOCKS5，也会强制启动内置 LB 与控制面。 |
-| `MANAGEMENT_ACTION_PROBE_TIMEOUT` | `180` | 启用、优雅重连或强制重连实际开始后等待 WARP 探测成功的最大秒数（默认 3 分钟）；不是连接排空超时。超时后实例保持摘流，并交由健康守护继续恢复。管理页会记录失败阶段 `warp-probe` 与原因码 `warp-probe-timeout`。 |
+| `MANAGEMENT_ACTION_PROBE_TIMEOUT` | `90` | 启用、优雅重连或强制重连实际开始后，等待“WARP 主探测通过且后端池同步确认 `up`”的最大秒数；默认与计划滚动重启一致，不是连接排空超时。超时后实例保持摘流，并交由健康守护继续恢复。管理页会记录失败阶段 `warp-probe` 与原因码 `warp-probe-timeout`。 |
+| `MANAGEMENT_IDLE_CHECK_INTERVAL` | `3` | 手工优雅重连、停用和移除遇到活跃连接时的复查间隔；支持秒数或 `1m` 等时长。只影响手工空闲优先队列，默认每 3 秒一次，不再复用计划滚动重启的延后队列周期。 |
 | `MICROWARP_LOG_FILE` | `/run/microwarp/console.log` | 网页控制台展示的运行时日志文件。该文件不应挂载到持久卷，容器重启会重新创建。 |
 | `MANAGEMENT_LOG_LINES` | `300` | 网页控制台一次返回的最近日志行数，范围 `50`–`2000`。 |
 | `LB_IDLE_TIMEOUT` | `600` | 内置前端的双向无流量超时秒数，不是连接总时长；客户端或后端任一方向有字节流动都会重置计时。提高默认值可避免 LLM 首个 token 较慢或流式中短暂停顿时被断开；请使用正数，`0` 或负数不是关闭超时的开关。 |
@@ -520,10 +524,12 @@ docker compose up -d
 | `STATUS_EVENT_LOG` | `1` | `1` 在首次观测及实例就绪状态、出口 IP/地理信息（`loc` / `colo`）、后端池或维护状态变化时输出完整图标状态表。已就绪行会并列显示 IPv4 / IPv6 出口及内置 LB 当前转发到该后端的活跃连接数；单实例轻量直连路径会显示 `活跃连接=—`，因为 microsocks/usque 不向控制面提供连接计数。`0` 仅关闭该表格。 |
 | `ROTATE_RESTART_ENABLED` | `auto` | `auto` 仅在实例数不少于 4 时启用滚动重启；`1` 在多实例部署中强制启用，`0` 关闭。 |
 | `ROTATE_RESTART_INTERVAL` | `6h` | 滚动重启间隔；支持秒数或 `6h` 等时长。 |
-| `ROTATE_RESTART_PROBE_TIMEOUT` | `90` | 重启后等待实例通过 WARP 探测的最大秒数。 |
+| `ROTATE_RESTART_PROBE_TIMEOUT` | `90` | 重启后等待实例通过共享的“WARP 就绪且确认重新入池”条件的最大秒数。 |
+| `RESTART_RECOVERY_PROBE_INTERVAL` | `3` | 手工重连与计划滚动重启共用的恢复确认复查间隔（秒）。每次确认都会重新执行 WARP 主探测，并同步确认后端池 `up` 已提交。 |
 | `ROTATE_RESTART_RETRIES` | `2` | 滚动重启后的实例未就绪时重试次数。 |
-| `ROTATE_RESTART_CONCURRENCY` | `auto` | `auto` 按当前实例总数的 `max(1, floor(总数 / 5))` 确定并行数（100 个实例为 20 个）；可设正整数显式覆盖。空闲实例完成后会立刻补充队列中的下一个空闲实例；繁忙实例不占用该并行额度。 |
-| `ROTATE_RESTART_DEFERRED_CHECK_INTERVAL` | `60` | 延后队列复查繁忙实例的间隔；支持秒数或 `1m` 等时长，默认每分钟一次。该配置同时用于定时滚动重启和手工优雅操作。 |
+| `ROTATE_RESTART_CONCURRENCY` | `auto` | 请求的滚动重启并行数。`auto` 按当前实例总数的 `max(1, floor(总数 / 5))` 计算；无论自动计算还是正整数显式请求，都会受 `ROTATE_RESTART_MAX_CONCURRENCY` 约束。空闲实例完成后会立刻补充队列中的下一个空闲实例；繁忙实例不占用该并行额度。 |
+| `ROTATE_RESTART_MAX_CONCURRENCY` | `10` | 滚动重启实际并行数的硬上限。即使 `ROTATE_RESTART_CONCURRENCY` 设置得更大，也会受此值限制，避免大量实例同时摘流、重启和探测造成控制面或上游瞬时拥塞。 |
+| `ROTATE_RESTART_DEFERRED_CHECK_INTERVAL` | `60` | **计划滚动重启**的延后队列复查繁忙实例的间隔；支持秒数或 `1m` 等时长，默认每分钟一次。手工优雅操作改由 `MANAGEMENT_IDLE_CHECK_INTERVAL` 控制。 |
 | `ROTATE_RESTART_HISTORY_LIMIT` | `20` | 管理页面保留的最近定时滚动重启轮次数；每轮包含摘要、失败原因、阶段、尝试次数和跳过诊断，均随运行时目录在容器重启时清理。 |
 
 #### 通过上游 SOCKS5 建立 WARP 注册与外层连接
@@ -630,7 +636,7 @@ MicroWARP 可以在**一个容器**中运行多个相互隔离的 WARP 实例。
 | 极简单实例 | `INSTANCE_COUNT=1`、`PROXY_MODE=socks5` | SOCKS5 | 无控制面；保留最低资源路径 |
 | 单实例 Mixed | `PROXY_MODE=mixed` | 同端口 SOCKS5 + HTTP | 内置 Mixed 前端与健康守护 |
 | 多实例 | `INSTANCE_COUNT=2+` | 唯一 LB 入口 | 实例控制、LB、健康守护 |
-| 多实例滚动换出口 | 同上 + `ROTATE_RESTART_ENABLED=1` | 不新开端口 | 空闲优先、繁忙延后的限并发滚动重启调度器（`auto` 默认总数的 1/5） |
+| 多实例滚动换出口 | 同上 + `ROTATE_RESTART_ENABLED=1` | 不新开端口 | 空闲优先、繁忙延后的限并发滚动重启调度器（`auto` 默认总数的 1/5，实际并行最多 10） |
 
 多实例示例：
 
@@ -681,13 +687,13 @@ services:
 
 管理面板还会在实例表前展示“**定时重启计划**”：它区分尚未触发的计划与正在执行的任务，显示启用/暂停状态、`ROTATE_RESTART_INTERVAL` 对应的周期、下次执行的绝对时间与倒计时、实例范围、有效并行额度、空闲优先策略，以及最近一轮的完成时间、耗时、成功、延后和失败数量。时间按访问者浏览器的本地时区显示；下次执行时间由容器内调度器写入状态文件，避免浏览器自行推导间隔。点击“管理计划”可查看完整策略，并可暂停或恢复**后续**轮次，也可点击“立即执行”请求守护进程立刻启动一轮滚动重启。立即执行与定时任务采用同一套空闲优先、繁忙延后、并发额度和单飞锁；请求受理后页面先显示“正在启动”，守护进程接管后显示实时进度。暂停不会中断已经开始的滚动重启；暂停状态下的“立即执行”仍会执行本轮，但不会恢复后续定时轮次，也不会改写 `ROTATE_RESTART_*` 环境变量；容器重启后该运行时暂停标记会自动清除，恢复为环境变量配置。定时滚动重启仅在多实例部署中可用，单实例面板会明确显示“仅多实例”。滚动重启实际执行时，计划卡显示整体进度；尚未轮到的空闲节点会在实例表“当前操作”中显示“等待定时重启”和队列位置，仍有活跃连接的节点会显示“等待自然空闲”，且继续留在后端池提供服务；正在处理的节点则继续在“进行中的任务”与实例行中展示摘流、重启及健康探测阶段。
 
-“当前活跃连接”只保留仍在转发的会话，显示请求 ID、协议、客户端、已提供的用户 ID、目标、**实际出口地址族（IPv4 / IPv6）**、后端实例、持续时间、空闲时间及双向字节数；双向流量统一按 **KB** 显示，连接关闭后立即从列表移除，不保留历史。每个实例可执行优雅重连、**强制重连**、停用或启用：优雅重连和停用会先进入空闲优先队列；有活跃连接时保持在后端池继续服务，**不设排空超时**，仅每 `ROTATE_RESTART_DEFERRED_CHECK_INTERVAL` 检查一次是否已自然空闲；连接归零后才摘流并执行操作。**强制重连**会立即摘流并停止实例，因此会中断该实例上的现有代理连接。启用或任一种重连后均等待 WARP 探测成功才入池。手工停用仅在当前容器运行期有效，容器重启后自动恢复启用；停用状态下两种重连都会被拒绝，需先启用。
+“当前活跃连接”只保留仍在转发的会话，显示请求 ID、协议、客户端、已提供的用户 ID、目标、**实际出口地址族（IPv4 / IPv6）**、后端实例、持续时间、空闲时间及双向字节数；双向流量统一按 **KB** 显示，连接关闭后立即从列表移除，不保留历史。每个实例可执行优雅重连、**强制重连**、停用或启用：优雅重连和停用会先进入空闲优先队列；有活跃连接时保持在后端池继续服务，**不设排空超时**，仅每 `MANAGEMENT_IDLE_CHECK_INTERVAL`（默认 `3` 秒）检查一次是否已自然空闲；连接归零后才摘流并执行操作。计划滚动重启仍按独立的 `ROTATE_RESTART_DEFERRED_CHECK_INTERVAL`（默认 `60` 秒）复查繁忙实例。**强制重连**会立即摘流并停止实例，因此会中断该实例上的现有代理连接。启用或任一种重连后，都会以同一完成条件确认：重新执行 WARP 主探测，并同步确认实例已提交为后端池 `up`。手工停用仅在当前容器运行期有效，容器重启后自动恢复启用；停用状态下两种重连都会被拒绝，需先启用。
 
 页面工具栏提供“临时添加”和“批量移除”。临时实例会使用与基础多实例相同的网络命名空间、健康探测和后端池机制，只写入 `/run/microwarp/instances.dynamic`；**容器重启后会自动恢复为 `INSTANCE_COUNT` 配置的基础实例数量**。因此仅支持 `INSTANCE_COUNT>=2` 的多实例部署，且基础实例与临时实例的总数最多为 `255`（实例 ID `0`~`254`）；临时实例同样支持启用、停用、优雅重连和强制重连，批量移除只允许选择临时实例。首次添加会异步触发健康探测，不会因可选双栈出口观测拖慢后续添加请求。顶部导航会固定在页面顶部，并提供自动刷新下拉选项：`1 秒`、`3 秒`、`5 秒`、`10 秒`、`15 秒`、`30 秒`，默认 `5 秒`。控制台日志面板默认显示 `/run/microwarp/console.log` 的最近 300 行，可用 `MANAGEMENT_LOG_LINES` 调整范围；提供“回到底部”以重新跟随实时输出，以及“复制日志”以复制当前显示内容。自动化调用：`POST /__microwarp/api/v1/instances/<实例号>/force-reconnect` 用于强制重连；`POST /__microwarp/api/v1/instances` 并传入 `{"action":"add","count":2}` 可临时添加 2 个实例，或传入 `{"action":"remove","ids":[2,3]}` 批量移除临时实例；接口立即返回 `202`，随后通过状态接口轮询结果。
 
 定时计划自动化接口为 `POST /__microwarp/api/v1/restart-schedule`：传入 `{"action":"pause"}` 暂停后续定时滚动重启，传入 `{"action":"resume"}` 恢复，传入 `{"action":"run-now"}` 可立即请求守护进程执行一轮。`run-now` 成功时返回 `202`，计划快照的 `status` 会先变为 `starting`，并带有 `run_now_requested=true`；守护进程取得调度锁后会原子消费请求并开始执行。已有轮次正在运行或存在未消费请求时，接口返回 `409` 以避免并发重复执行。立即执行沿用既有策略，且即使后续定时轮次已暂停也会执行当前请求，但不会恢复暂停状态。计划详情与执行结果同时包含在 `GET /__microwarp/api/v1/status` 的 `restart_schedule` 字段中。该接口不会在运行时修改周期、并发或延后队列复查配置；如需调整这些策略，请修改对应的 `ROTATE_RESTART_*` 环境变量后重建容器。
 
-管理操作采用可追踪任务闭环：接口的 `202` 响应会返回 `operation.operation_id`、动作、排队状态和开始时间；`GET /__microwarp/api/v1/status` 中的实例操作会持续返回阶段、消息、开始时间、已耗时和终态标记，繁忙的优雅重连、停用或临时实例移除会显示“等待自然空闲”、当前连接数与下次复查时间；批量增减还会返回总数、已处理、成功与失败数量。页面在存在任务时自动以 `1 秒` 刷新，完成或失败后给出明确结果；失败实例可直接重试或跳转到该实例的管理日志。若 WARP 探测达到 `MANAGEMENT_ACTION_PROBE_TIMEOUT`，会先记录 `warp-probe-timeout`；健康守护在后续探测中确认实例恢复并重新入池后，会将终态更新为 `recovered`（超时后已恢复），同时保留首次超时的时间、原因码、原因和超时后恢复等待时间，避免实际已健康但页面仍显示失败。优雅重连与停用的确认框会展示活跃连接数和队列策略；存在活跃连接时，强制重连必须勾选“我知道这会立即中断当前实例上的连接”才能提交。实例区支持按需要关注、操作中、健康、已停用和临时实例筛选；页面会展示数据新鲜度与刷新错误。日志区支持警告/错误筛选、暂停跟随时的新日志计数，并可从失败实例跳转到相关管理日志。
+管理操作采用可追踪任务闭环：接口的 `202` 响应会返回 `operation.operation_id`、动作、排队状态和开始时间；`GET /__microwarp/api/v1/status` 中的实例操作会持续返回阶段、消息、开始时间、已耗时和终态标记，繁忙的优雅重连、停用或临时实例移除会显示“等待自然空闲”、当前连接数与下次复查时间；批量增减还会返回总数、已处理、成功与失败数量。每次手工与计划重启都使用相同的恢复完成条件和复查节奏：重新执行 WARP 主探测，再同步确认后端池 `up` 已提交；页面同时记录连接排空、摘流、停止、启动、WARP 就绪、重新入池等阶段时间，便于定位耗时。页面在存在任务时自动以 `1 秒` 刷新，完成或失败后给出明确结果；失败实例可直接重试或跳转到该实例的管理日志。若 WARP 探测达到 `MANAGEMENT_ACTION_PROBE_TIMEOUT`，会先记录 `warp-probe-timeout` 和主动确认超时的时间；健康守护在后续探测中确认实例恢复并重新入池后，会将终态更新为 `recovered`（**超时后恢复**），同时保留首次超时的时间、原因码、原因、阶段时间线和超时后恢复等待时间，避免把“管理主动确认超时”误展示为“强制重连已恢复”。优雅重连与停用的确认框会展示活跃连接数和队列策略；存在活跃连接时，强制重连必须勾选“我知道这会立即中断当前实例上的连接”才能提交。实例区支持按需要关注、操作中、健康、已停用和临时实例筛选；页面会展示数据新鲜度与刷新错误。日志区支持警告/错误筛选、暂停跟随时的新日志计数，并可从失败实例跳转到相关管理日志。
 
 > **匿名访问：** 管理页面与 API 会刻意绕过 SOCKS / HTTP Proxy 认证。启用前应仅通过可信宿主机绑定、私有网络、防火墙或反向代理 ACL 开放 `BIND_PORT`。
 
@@ -695,7 +701,7 @@ services:
 
 每个实例通过其内部 SOCKS 请求 `https://www.cloudflare.com/cdn-cgi/trace`。只有返回 `warp=on` 或 `warp=plus` 时才加入后端池。每轮健康检查采用动态并发窗口：已经完成的实例会立即让出位置给下一个实例。单个工作流中的 WARP 主探测、IPv4 出口探测和启用后的 IPv6 出口探测会并行启动；**WARP 主探测成功后会立即写入 `ready` 并登记入池请求**，不等待出口观测完成。为避免单实例三类探测把资源消耗放大，健康守护、Docker 健康检查、手工 `probe` 和管理面强制探测共享一个令牌池，默认同时最多运行 `HEALTH_PROBE_CONCURRENCY=32` 个实际 HTTP 探测请求。大量实例同时就绪时，后端池状态会先写入待处理目录，并由一个提交者在 `BACKEND_POOL_BATCH_WINDOW_MS`（默认 100ms）内合并、原子更新 `backends.meta` 与 `backends.txt`；这避免了每个实例依次持锁重建整个后端池，也不会因旧版 5 秒锁等待而丢失 `up` 状态。IPv4/IPv6 结果随后补写至状态文件；它们失败或超时只会显示为 `—`，不会让已就绪实例摘流。健康守护从启动起每 `HEALTH_STARTUP_RETRY_INTERVAL`（默认 3 秒）尝试入池；`HEALTH_START_PERIOD`（默认 90 秒）只用于抑制这段时间内的失败重启，不会让已经就绪的后端空等 90 秒。宽限期后连续失败达到 `HEALTH_SOFT_FAILURES` 时才重启该实例，且默认**不会删除持久化身份**。
 
-滚动重启会在每轮开始时快照当前基础实例和临时实例，并逐一判断是否可处理：仅健康状态为 `ready`、仍在后端池中，且未被手工停用、未执行管理操作、未处于其他重启流程的实例才会参与本轮分类。默认 `ROTATE_RESTART_CONCURRENCY=auto` 时，并行额度为 `max(1, floor(当前实例总数 / 5))`；例如 100 个实例会同时最多处理 20 个。可设置正整数显式覆盖，例如 `ROTATE_RESTART_CONCURRENCY=5`。
+滚动重启会在每轮开始时快照当前基础实例和临时实例，并逐一判断是否可处理：仅健康状态为 `ready`、仍在后端池中，且未被手工停用、未执行管理操作、未处于其他重启流程的实例才会参与本轮分类。默认 `ROTATE_RESTART_CONCURRENCY=auto` 时，请求并行数为 `max(1, floor(当前实例总数 / 5))`；实际并行数还会被 `ROTATE_RESTART_MAX_CONCURRENCY`（默认 `10`）限制，因此 100 个实例会同时最多处理 10 个。正整数请求值同样受该上限限制；例如 `ROTATE_RESTART_CONCURRENCY=5` 会实际并行 5 个，若确有容量需要提高并发，须同时提高 `ROTATE_RESTART_MAX_CONCURRENCY`。
 
 调度器使用空闲优先的连续队列：活跃连接数为 `0` 的实例进入就绪队列；仍有活跃连接的实例进入延后队列，保持在后端池中继续服务。延后队列按 `ROTATE_RESTART_DEFERRED_CHECK_INTERVAL`（默认 `60` 秒）在**同一轮滚动重启内**复查，连接自然归零后立即转入就绪队列；延后不是失败，也不会占用重启并行额度。真正回收前，实例会先经统一的后端池请求通道登记 `down`，并在 `backends.meta` 与后端列表完成批量提交后才确认摘流；若请求暂未确认（例如批量提交者繁忙或遗留锁正在恢复），实例保持运行并进入独立的“后端池重试队列”，按 `1s`、`2s`、`5s`、`10s` 退避重试，**不会被混入连接延后队列，也不会在未确认摘流时重启或中断既有会话**。请求可能由另一提交者在稍后完成摘流；调度器会识别这个安全中间状态并在下一次重试中重新确认，而不会误判为“未入池”跳过。若摘流后复核发现新连接，则立即经同一通道恢复流量并转入连接延后队列。重试超过 `BACKEND_POOL_OPERATION_RETRY_LIMIT` 后才记录最终失败，失败原因会区分确认超时、并发状态冲突与更新异常。调度器不是按固定分组等待：任一空闲实例完成或失败后，会立即从就绪队列补充下一个空闲实例，因此整个过程中在有待处理实例时始终尽量维持该并行数。确认空闲和摘流后才执行重启、trace 验证 WARP 就绪和重新入池；定时滚动重启不会因连接排空超时而强制中断代理会话。
 

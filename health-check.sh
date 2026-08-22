@@ -108,12 +108,16 @@ operation_value() {
     awk -F= -v key="$key" '$1 == key { value=substr($0, length(key) + 2) } END { print value }' "$file" 2>/dev/null
 }
 
+# 管理控制器会逐阶段记录这些时间。健康守护把超时操作改写为 recovered 时也
+# 必须保留它们，否则最需要排障的“超时后恢复”恰好丢失启动与探测时间线。
+MANAGEMENT_OPERATION_MILESTONES="idle_wait_started_at idle_confirmed_at backend_drained_at backend_restored_at instance_stop_started_at instance_stopped_at instance_start_started_at instance_started_at warp_probe_started_at warp_ready_at pool_rejoined_at probe_timed_out_at health_recovered_at"
+
 reconcile_timed_out_management_operation() {
     # 管理操作达到探测上限后，健康守护可能在后续轮次才发现 WARP 已恢复。
     # 此时把终态从 failed 更新为 recovered，并保留首次超时的时间和原因，避免
     # 面板长期显示“失败”而实际节点已健康入池的状态分叉。
     local id="$1" target lock action status reason operation_id started_at timed_out_at timeout_duration
-    local timeout_message now recovered_delay total_duration temporary
+    local timeout_message now recovered_delay total_duration temporary milestone milestone_at
     target="$(management_operation_file "$id")"
     [[ -f "$target" ]] || return 0
     # 与管理控制器共用同一把实例锁：取得锁后才读取并改写状态文件，避免一个新
@@ -161,6 +165,12 @@ reconcile_timed_out_management_operation() {
         printf 'timed_out_at=%s\ntimeout_duration_seconds=%s\n' "$timed_out_at" "$timeout_duration"
         printf 'timeout_reason_code=warp-probe-timeout\n'
         [[ -n "$timeout_message" ]] && printf 'timeout_message=%s\n' "${timeout_message//$'\n'/ }"
+        for milestone in $MANAGEMENT_OPERATION_MILESTONES; do
+            [[ "$milestone" = "health_recovered_at" ]] && continue
+            milestone_at="$(operation_value "$target" "$milestone")"
+            [[ "$milestone_at" =~ ^[0-9]+$ ]] && printf '%s=%s\n' "$milestone" "$milestone_at"
+        done
+        printf 'health_recovered_at=%s\n' "$now"
         printf 'recovered_at=%s\nrecovery_delay_seconds=%s\nrecovered_after_timeout=yes\n' "$now" "$recovered_delay"
     } > "$temporary"
     mv "$temporary" "$target"
@@ -519,6 +529,18 @@ update_backend() {
     done
 }
 
+confirm_warp_ready() {
+    local id="$1"
+    [[ "$id" =~ ^[0-9]+$ ]] || return 2
+    # 已手工停用的实例不能因旧 ready 状态或外部 ready 调用被重新入池。
+    [[ ! -f "$(manual_disabled_file "$id")" ]] || return 1
+    # 每次恢复确认都强制重新运行主 WARP 探测，不能因管理锁或重启前残留的
+    # ready 状态误判新进程已经可用。主探测成功后再同步确认 up 已提交到后端池。
+    MANAGEMENT_FORCE_PROBE=1 check_one "$id" || true
+    grep -q '^ready ' "$(state_file "$id")" 2>/dev/null || return 1
+    update_backend "$id" up confirmed
+}
+
 probe_instance() {
     local id="$1" backend proxy output
     backend="$(backend_for "$id")"
@@ -837,7 +859,14 @@ if [[ "${HEALTH_CHECK_LIB_ONLY:-0}" != "1" ]]; then
             check_one "$id" || true
             grep -q '^ready ' "$(state_file "$id")" 2>/dev/null
             ;;
+        ready)
+            id="${2:-}"
+            runtime_instance_exists "$id" || { echo "实例 ID 非法" >&2; exit 1; }
+            # 计划重启、优雅重连和强制重连共用的恢复完成条件：WARP 主探测通过，
+            # 且后端池元数据已同步确认 up。调用方据此才能报告“实例已恢复”。
+            confirm_warp_ready "$id"
+            ;;
         docker) docker_healthcheck ;;
-        *) echo "用法: $0 {daemon|once|pool|probe|docker}"; exit 1 ;;
+        *) echo "用法: $0 {daemon|once|pool|probe|ready|docker}"; exit 1 ;;
     esac
 fi

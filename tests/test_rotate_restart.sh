@@ -68,7 +68,7 @@ set -euo pipefail
 case "${1:-}" in
     # 滚动重启必须通过健康脚本的统一后端池入口，不再直接争抢 backends.lock。
     pool) exit 0 ;;
-    probe)
+    probe|ready)
         id="$2"
         state="${MICROWARP_RUNTIME_ROOT:?}/instances/${id}/rotation.state"
         grep -qx 'action=rolling-restart' "$state"
@@ -319,5 +319,14 @@ assert_file_missing "${RUNTIME_ROOT}/rotate-restart.run-now"
 kill "$DAEMON_PID" 2>/dev/null || true
 wait "$DAEMON_PID" 2>/dev/null || true
 DAEMON_PID=""
+
+# auto 的 1/5 计算和用户显式请求都必须受硬上限约束；否则实例数很大时会
+# 再次形成大批实例同时摘流、重启和探测的控制面尖峰。
+auto_status="$(MICROWARP_RUNTIME_ROOT="$RUNTIME_ROOT" INSTANCE_COUNT=100 ROTATE_RESTART_ENABLED=1 ROTATE_RESTART_CONCURRENCY=auto ROTATE_RESTART_MAX_CONCURRENCY=10 "${ROOT}/rotate-restart.sh" status)"
+explicit_status="$(MICROWARP_RUNTIME_ROOT="$RUNTIME_ROOT" INSTANCE_COUNT=100 ROTATE_RESTART_ENABLED=1 ROTATE_RESTART_CONCURRENCY=50 ROTATE_RESTART_MAX_CONCURRENCY=10 "${ROOT}/rotate-restart.sh" status 2>/dev/null)"
+auto_effective="$(printf '%s\n' "$auto_status" | awk '{ for (i = 1; i <= NF; i++) if ($i ~ /^concurrency=/) { split($i, pair, "="); print pair[2] } }')"
+explicit_effective="$(printf '%s\n' "$explicit_status" | awk '{ for (i = 1; i <= NF; i++) if ($i ~ /^concurrency=/) { split($i, pair, "="); print pair[2] } }')"
+assert_eq 10 "$auto_effective" "auto 的 1/5 并行数必须最多为 10"
+assert_eq 10 "$explicit_effective" "显式请求的滚动重启并行数也必须最多为 10"
 
 echo "通过：限并发滚动重启"
